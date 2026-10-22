@@ -62,6 +62,8 @@ readable, and `protect --apply` cannot write configuration.
 
 ### `scan` — host audit
 
+![php2shell-guard scan on Ubuntu 24.04: php -v says 8.3.6, the scanner proves the backport](docs/media/scan-patched.png)
+
 ```
 $ sudo python3 php2shell-guard.py scan
 == PHP runtimes (3) ==
