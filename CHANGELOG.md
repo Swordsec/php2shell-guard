@@ -1,0 +1,18 @@
+# Changelog
+
+## 1.0.0 - 2026-10-22
+
+Initial release, one day after the php.net fixed releases.
+
+- `scan`: binary discovery across ~60 layouts, running-worker and Apache module
+  detection via `/proc`, stale-binary detection, patch markers
+  (`memory_hard_limit_percent`, `zend_mm_safe_error_ex`), dpkg/rpm/apk/pacman/brew
+  package checks with changelog CVE grep, per-SAPI effective INI, FPM pool dumps,
+  Apache directive audit, Docker container inspection, JSON output.
+- `protect`: php.net interim mitigations as conf.d drop-ins, FPM pool `php_admin_*`
+  blocks, Apache `php_admin_*` conf with syntax test; dry run, apply, rollback, restart.
+- `hunt`: error-log signatures, session-file injection, webroot/webshell heuristics,
+  web-worker child processes, persistence changes.
+- `remote`: passive banner check with CDN/WAF fingerprinting and an inert WAF coverage probe.
+- `rules`: ModSecurity, nginx, Apache, HAProxy, Suricata, Caddy snippets.
+- `quickcheck.sh`: POSIX sh variant for hosts without Python.

@@ -1,0 +1,20 @@
+# php2shell-guard - Suricata/Snort rules for CVE-2026-109618 / CVE-2026-109619
+# SIDs 9951100-9951199 reserved for this file. Test before deploying inline.
+
+alert http $EXTERNAL_NET any -> $HOME_NET any (msg:"PHP2SHELL session upload-progress field in multipart POST"; flow:established,to_server; http.method; content:"POST"; http.content_type; content:"multipart/form-data"; nocase; http.request_body; content:"PHP_SESSION_UPLOAD_PROGRESS"; fast_pattern; classtype:web-application-attack; reference:cve,2026-109619; reference:url,www.php.net/archive/2026.php#2026-10-21-5; sid:9951101; rev:1; metadata:php2shell, severity critical;)
+
+alert http $EXTERNAL_NET any -> $HOME_NET any (msg:"PHP2SHELL PHP open tag in multipart upload filename"; flow:established,to_server; http.method; content:"POST"; http.content_type; content:"multipart/form-data"; nocase; http.request_body; content:"filename="; content:"<?"; distance:0; within:300; classtype:web-application-attack; reference:cve,2026-109619; sid:9951102; rev:1; metadata:php2shell, severity critical;)
+
+alert http $EXTERNAL_NET any -> $HOME_NET any (msg:"PHP2SHELL serialized object marker in multipart upload filename"; flow:established,to_server; http.method; content:"POST"; http.request_body; content:"filename="; content:"|7c|O:"; distance:0; within:300; pcre:"/filename=[^\r\n]{0,200}\|O:\d+:\"/"; classtype:web-application-attack; reference:cve,2026-109619; sid:9951103; rev:1; metadata:php2shell, severity high;)
+
+alert http $EXTERNAL_NET any -> $HOME_NET any (msg:"PHP2SHELL chunked multipart POST without Content-Length"; flow:established,to_server; http.method; content:"POST"; http.header; content:"Transfer-Encoding|3a 20|chunked"; nocase; http.content_type; content:"multipart/form-data"; nocase; http.header; content:!"Content-Length|3a|"; nocase; classtype:attempted-dos; reference:cve,2026-109618; sid:9951104; rev:1; metadata:php2shell, severity medium;)
+
+alert http $EXTERNAL_NET any -> $HOME_NET any (msg:"PHP2SHELL very large urlencoded POST body (possible OOM trigger)"; flow:established,to_server; http.method; content:"POST"; http.content_type; content:"application/x-www-form-urlencoded"; nocase; http.content_len; byte_test:0,>,3000000,0,string,dec; classtype:attempted-dos; reference:cve,2026-109618; sid:9951105; rev:1; metadata:php2shell, severity medium;)
+
+alert http $HOME_NET any -> $EXTERNAL_NET any (msg:"PHP2SHELL pre-script memory exhaustion fatal error in response"; flow:established,to_client; http.response_body; content:"Allowed memory size of"; content:"Unknown on line 0"; distance:0; within:120; classtype:web-application-attack; reference:cve,2026-109618; sid:9951110; rev:1; metadata:php2shell, severity high;)
+
+alert http $HOME_NET any -> $EXTERNAL_NET any (msg:"PHP2SHELL session destruction failure message in response"; flow:established,to_client; http.response_body; content:"Session object destruction failed"; classtype:web-application-attack; reference:cve,2026-109619; sid:9951111; rev:1; metadata:php2shell, severity high;)
+
+alert http $HOME_NET any -> $EXTERNAL_NET any (msg:"PHP2SHELL unusually long PHPSESSID in Set-Cookie (possible heap leak)"; flow:established,to_client; http.header; content:"Set-Cookie|3a 20|PHPSESSID="; nocase; pcre:"/Set-Cookie\x3a\x20PHPSESSID=[^;\r\n]{300,}/i"; classtype:web-application-attack; reference:cve,2026-109619; sid:9951112; rev:1; metadata:php2shell, severity medium;)
+
+alert http $HOME_NET any -> $EXTERNAL_NET any (msg:"PHP2SHELL server advertises unpatched PHP 8.x banner"; flow:established,to_client; http.header; content:"X-Powered-By|3a 20|PHP/8."; nocase; pcre:"/X-Powered-By\x3a\x20PHP\/8\.(?:2\.(?:[0-9]|[12][0-9]|3[0-4])|3\.(?:[0-9]|[12][0-9]|3[0-5])|4\.(?:[0-9]|1[0-9]|2[0-6])|5\.(?:[0-9]|1[01]))(?:[^0-9]|$)/i"; threshold:type limit,track by_src,count 1,seconds 3600; classtype:policy-violation; reference:cve,2026-109618; sid:9951120; rev:1; metadata:php2shell, severity informational;)

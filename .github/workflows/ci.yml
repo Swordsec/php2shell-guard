@@ -1,0 +1,75 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.8", "3.10", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m py_compile php2shell-guard.py
+      - run: python -m unittest discover -s tests -v
+      - run: python php2shell-guard.py rules all > /dev/null
+      - run: python php2shell-guard.py --help
+
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get install -y shellcheck
+      - run: shellcheck -s sh quickcheck.sh
+      - run: sh quickcheck.sh || true
+
+  images:
+    # Real PHP builds: fixed official images must be PATCHED, an old one VULNERABLE,
+    # and the Ubuntu backport (old version string) must be recognised as PATCHED.
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: php:8.3-fpm-alpine
+            expect: 0
+          - image: php:8.4-apache
+            expect: 0
+          - image: php:8.3.20-fpm
+            expect: 1
+          - image: php:8.1-fpm
+            expect: 1
+    steps:
+      - uses: actions/checkout@v4
+      - name: quickcheck in ${{ matrix.image }}
+        run: |
+          set +e
+          docker run --rm -v "$PWD:/g:ro" ${{ matrix.image }} sh /g/quickcheck.sh
+          rc=$?
+          echo "exit=$rc expected=${{ matrix.expect }}"
+          [ "$rc" -eq "${{ matrix.expect }}" ]
+
+  ubuntu-backport:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: scan + protect + rollback on Ubuntu 24.04 with apt PHP
+        run: |
+          docker run --rm -v "$PWD:/g:ro" ubuntu:24.04 bash -c '
+            set -e
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update -qq && apt-get install -y -qq --no-install-recommends python3 php-fpm php-cli libapache2-mod-php apache2 >/dev/null
+            service php8.3-fpm start || true; apachectl start || true
+            python3 /g/php2shell-guard.py --no-color scan
+            python3 /g/php2shell-guard.py --no-color scan --json | python3 -c "import sys,json; d=json.load(sys.stdin); assert d[\"verdict\"]==\"PATCHED\", d[\"verdict\"]"
+            python3 /g/php2shell-guard.py --no-color protect --apply --post-max 32M --restart
+            php-fpm8.3 -i | grep -E "^session.upload_progress.enabled => Off"
+            python3 /g/php2shell-guard.py --no-color protect --rollback --apply
+            ! grep -rl php2shell-guard /etc/php /etc/apache2
+            python3 /g/php2shell-guard.py --no-color hunt --days 3 || true
+          '

@@ -1,0 +1,28 @@
+# php2shell-guard - Caddy / FrankenPHP front-end limits for CVE-2026-109618 / CVE-2026-109619
+# FrankenPHP embeds PHP; the same ini mitigations apply (php.ini or the
+# php_ini directive). Cap the body before PHP parses it:
+
+example.com {
+    request_body {
+        max_size 32MB
+    }
+    @upload_progress {
+        method POST
+        header Content-Type *multipart/form-data*
+        # Caddy cannot match bodies natively; put Coraza (caddy-coraza) in front:
+        #   coraza_waf { directives ` Include /etc/coraza/php2shell.conf ` }
+    }
+    @chunked_multipart {
+        method POST
+        header Transfer-Encoding *chunked*
+        header Content-Type *multipart/form-data*
+    }
+    respond @chunked_multipart 411
+
+    php_server {
+        # FrankenPHP: ini values that apply before request parsing
+        php_ini session.upload_progress.enabled 0
+        php_ini post_max_size 32M
+        php_ini upload_max_filesize 30M
+    }
+}
