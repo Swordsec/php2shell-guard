@@ -58,16 +58,21 @@ candidates() {
 }
 
 has_marker() {
-    # grep -a is not universal (busybox); fall back to tr
+    # grep -a is not universal (busybox); fall back to tr. Octal range on purpose:
+    # busybox tr -c does not understand [:print:].
     if grep -a -q -e memory_hard_limit_percent -e zend_mm_safe_error_ex "$1" 2>/dev/null; then
         return 0
     fi
-    tr -c '[:print:]' '\n' < "$1" 2>/dev/null | grep -q -e memory_hard_limit_percent -e zend_mm_safe_error_ex
+    tr -c '\040-\176' '\n' < "$1" 2>/dev/null | grep -q -e memory_hard_limit_percent -e zend_mm_safe_error_ex
+}
+
+printable() {
+    tr -c '\040-\176' '\n' < "$1" 2>/dev/null
 }
 
 version_of() {
     case "$1" in
-        *.so) tr -c '[:print:]' '\n' < "$1" 2>/dev/null | grep -o 'X-Powered-By: PHP/[0-9][0-9.]*[A-Za-z0-9-]*' | head -1 | sed 's#.*PHP/##' ;;
+        *.so) printable "$1" | grep -o 'X-Powered-By: PHP/[0-9][0-9.]*[A-Za-z0-9-]*' | head -1 | sed 's#.*PHP/##' ;;
         *frankenphp*) "$1" version 2>/dev/null | grep -o 'PHP [0-9][0-9.]*' | head -1 | cut -d' ' -f2 ;;
         *) "$1" -n -v 2>/dev/null | grep -o 'PHP [0-9][0-9.]*[A-Za-z0-9-]*' | head -1 | cut -d' ' -f2 ;;
     esac

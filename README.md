@@ -17,6 +17,7 @@ inert WAF coverage probe.
 sudo python3 php2shell-guard.py scan                 # am I patched? (binaries, packages, workers, ini, FPM pools, Docker)
 sudo python3 php2shell-guard.py protect --apply      # php.net interim mitigations, with --rollback
 sudo python3 php2shell-guard.py hunt                 # was I hit? (logs, session files, webroots, worker children)
+python3 php2shell-guard.py scan --docker             # the same for PHP inside running containers (no root needed)
 python3 php2shell-guard.py remote -f hosts.txt       # fleet banner check (your own hosts)
 python3 php2shell-guard.py rules modsecurity         # WAF / proxy / IDS snippets
 sh quickcheck.sh                                     # no python? 10-second answer
@@ -99,12 +100,13 @@ What it looks at:
   plus FPM pool `php_admin_*` overrides and `pm.max_requests`;
 * Apache `php_value`/`php_admin_value`/`RLimitMEM` directives (php.net warns against
   `RLIMIT_AS`/`RLIMIT_DATA`: they cause exactly the allocation failure the bug needs);
-* with `--docker`, every running container: PHP version and patch markers inside it.
+* with `--docker`, the same checks inside every running container (see
+  [Docker containers](#docker-containers)).
 
 Severity drops automatically once a runtime is confirmed patched (e.g. upload progress
 still enabled becomes LOW, as php.net suggests keeping it off anyway).
 
-Options: `--json`, `-o report.json`, `--docker`, `--no-config` (faster). Exit code 0
+Options: `--json`, `-o report.json`, `--docker`, `--container NAME`, `--no-config` (faster). Exit code 0
 patched, 1 vulnerable, 2 undetermined.
 
 ### `protect` — interim mitigations with rollback
@@ -161,6 +163,61 @@ sudo python3 php2shell-guard.py hunt --webroot /var/www/site --logs /var/log/apa
 Exit code 1 when a CRITICAL/HIGH indicator was found. Amazon observed the first
 exploitation attempt on **2026-10-17**, four days before disclosure; use a window that
 reaches back at least that far.
+
+### Docker containers
+
+Official `php:*` images have no Python and no `ps`, and the host's `PATH` and `/proc`
+walk never see the PHP inside them. With `--docker` every command runs its checks
+inside the running containers from the host: probes go through `docker exec` (as root
+in the container), file trees are streamed out with `docker cp`, and bind mounts from
+`docker inspect` are read on the host directly. Docker access is enough, no `sudo`.
+
+```bash
+python3 php2shell-guard.py scan --docker                          # host + every running container
+python3 php2shell-guard.py scan --container php74 --json          # one container (name or id prefix, repeatable)
+python3 php2shell-guard.py protect --docker                       # dry run inside every PHP container
+python3 php2shell-guard.py protect --docker --apply --restart     # write + graceful FPM/Apache reload
+python3 php2shell-guard.py protect --docker --rollback --apply --restart
+python3 php2shell-guard.py hunt --docker --days 14
+```
+
+```
+== Docker containers with PHP (2) ==
+  PATCHED    php83  image=docker-multi-php-php83  compose docker-multi-php/php83
+      PATCHED    /usr/local/sbin/php-fpm
+          kind=fpm  version=8.3.36 (-v)  status=patched: fixed release
+          patch-markers=memory_hard_limit_percent  running pid 1  found-via=PATH,path-glob,process
+  VULNERABLE php74  image=docker-multi-php-php74  compose docker-multi-php/php74
+  ...
+  [CRITICAL] php74:/usr/local/sbin/php-fpm (fpm) is unpatched (PHP 7.4.33, branch 7.4 has no upstream fix ...)
+             -> rebuild on PHP 8.2+ (e.g. php:8.3-fpm; ...): update FROM in the service's Dockerfile, then
+                docker compose -f .../docker-compose.yml build --pull php74 && docker compose -f ... up -d php74
+```
+
+| Command | Inside each container |
+|---|---|
+| `scan` | every PHP binary and `libphp*.so` (PATH, known layouts, process exes and maps), version, patch markers, running and stale workers, effective ini per binary, FPM pool dump, dpkg/rpm/apk/pacman packages, Apache directives; fix hints use the Compose service and project files when the container came from Compose |
+| `protect` | the same drop-in / pool block / Apache conf as on a host, written with `docker exec`; `--restart` sends `USR2` to each FPM master and `USR1` to Apache (graceful) and checks that the workers were replaced, falling back to `docker restart` only when neither is found |
+| `hunt` | `docker logs` for the window, error logs inside the container (or on the host when bind-mounted), session files, webroots (bind mounts are walked on the host once even when several services share them), shells spawned by web workers, and `docker diff`: PHP files and cron / ssh / passwd / `ld.so.preload` changes in the container's writable layer |
+
+With `--docker`, `protect` and `hunt` work on the containers instead of the host, and
+`hunt --logs/--session-dir/--webroot` name paths inside the containers.
+
+Changes `protect` makes inside a container live in its writable layer: they survive
+`docker restart` but are gone after `docker compose up --build` / `--force-recreate` or
+an image update. Files on a bind mount are changed on the host and persist. After
+`--apply` it prints the `docker cp` command and the read-only volume line that keep the
+drop-in, for example:
+
+```yaml
+services:
+  php74:
+    volumes:
+      - ./zz-php2shell-guard.ini:/usr/local/etc/php/conf.d/zz-php2shell-guard.ini:ro
+```
+
+The real fix for a container is a rebuild on a fixed base image (`docker compose build
+--pull` only helps when the Dockerfile's `FROM` already points at a fixed branch).
 
 ### `remote` — fleet banner check (your own hosts)
 
@@ -260,7 +317,7 @@ If your layout is missing, open an issue with `php --ini` output.
 | `scan` | all patched / no PHP | something vulnerable | undetermined | usage |
 | `hunt` | no CRITICAL/HIGH indicator | indicator found | | usage |
 | `remote` | nothing likely vulnerable | likely vulnerable target | all unreachable / no banner | usage |
-| `protect` | done / dry run | | | needs root / bad args |
+| `protect` | done / dry run | | | needs root / bad args / Docker unreachable |
 
 ## Limitations
 
@@ -273,6 +330,10 @@ If your layout is missing, open an issue with `php --ini` output.
   HTTP 200 with no error logged at all.
 * `remote` cannot see configuration or backports and is deliberately passive.
 * `protect` edits configuration; read the dry run first and keep the `.bak` files.
+* `--docker` sees running containers only; stopped containers and images are not
+  inspected. Containers without `sh` (distroless) are skipped. Bind mounts are only read
+  on the host when the Docker daemon shares this machine's filesystem (Docker Desktop,
+  OrbStack, Linux); with a remote `DOCKER_HOST` everything goes through the container.
 
 ## References
 

@@ -295,5 +295,237 @@ class BinaryNames(unittest.TestCase):
         self.assertEqual(guard.binary_kind("/usr/bin/php"), "cli")
 
 
+class WebshellPatterns(unittest.TestCase):
+    def hits(self, data):
+        return [rx for rx in guard.WEBSHELL_PATTERNS if rx.search(data)]
+
+    def test_kit_names_still_match(self):
+        for s in (b"<?php // c99shell v.1.0", b"$FilesMan = 1;", b"WSO 2.5", b"wso_version", b"b374k shell", b"echo `uname -a;`"):
+            self.assertTrue(self.hits(s), s)
+
+    def test_no_false_positives_on_application_code(self):
+        for s in (b"$this->shouldShowSocialIds($request)", b"'COFFEE1919_378ddc9925f4.png'",
+                  b"<?php /* 5b0832cb98e7c99029709ebfc90452dc */", b"newSorting(); rowSort();"):
+            self.assertEqual(self.hits(s), [], s)
+
+
+def inspect_info(mounts=(), labels=None, name="/php83"):
+    return {"Id": "124429377f67" + "0" * 52, "Name": name, "State": {"Running": True},
+            "Config": {"Image": "docker-multi-php-php83", "Labels": labels or {}},
+            "Mounts": [dict(m) for m in mounts]}
+
+
+class DockerContainer(unittest.TestCase):
+    def test_host_path_longest_bind_mount_wins(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "sites", "app"))
+            os.makedirs(os.path.join(d, "logs"))
+            ct = guard.Container(inspect_info([
+                {"Type": "bind", "Source": os.path.join(d, "sites"), "Destination": "/var/www/html"},
+                {"Type": "bind", "Source": os.path.join(d, "logs"), "Destination": "/var/www/html/app/logs"},
+                {"Type": "volume", "Source": "/var/lib/docker/volumes/x/_data", "Destination": "/data"},
+            ]))
+            self.assertEqual(ct.host_path("/var/www/html/app/index.php"), os.path.join(d, "sites", "app", "index.php"))
+            self.assertEqual(ct.host_path("/var/www/html/app/logs/error.log"), os.path.join(d, "logs", "error.log"))
+            self.assertEqual(ct.host_path("/var/www/html"), os.path.join(d, "sites"))
+            self.assertIsNone(ct.host_path("/var/www/htmlx/a.php"))
+            self.assertIsNone(ct.host_path("/data/x"))
+            self.assertIsNone(ct.host_path("/usr/local/etc/php/conf.d/x.ini"))
+
+    def test_host_path_refuses_symlink_escape_and_missing_source(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "sites")
+            os.mkdir(src)
+            os.symlink("/etc", os.path.join(src, "evil"))
+            ct = guard.Container(inspect_info([
+                {"Type": "bind", "Source": src, "Destination": "/var/www/html"},
+                {"Type": "bind", "Source": os.path.join(d, "nope"), "Destination": "/srv"},
+            ]))
+            self.assertIsNone(ct.host_path("/var/www/html/evil/passwd"))
+            self.assertIsNone(ct.host_path("/srv/a.php"))
+
+    def test_compose_needs_container_labels(self):
+        image_only = {"com.docker.compose.project": "docker-multi-php", "com.docker.compose.service": "php83"}
+        self.assertIsNone(guard.Container(inspect_info(labels=image_only)).compose)
+        full = dict(image_only, **{"com.docker.compose.config-hash": "abc",
+                                   "com.docker.compose.project.working_dir": "/srv/stack",
+                                   "com.docker.compose.project.config_files": "/srv/stack/docker-compose.yml"})
+        ct = guard.Container(inspect_info(labels=full))
+        self.assertEqual(ct.compose["service"], "php83")
+        self.assertEqual(ct.name, "php83")
+        self.assertEqual(ct.id, "124429377f67")
+
+    def test_proc_snapshot(self):
+        us = "\x1f"
+        text = "\n".join([
+            "P" + us + "1 (php-fpm) S 0 1 1 0 -1 4194560" + us + "/usr/local/sbin/php-fpm" + us + "php-fpm: master process (/usr/local/etc/php-fpm.conf) ",
+            "P" + us + "7 (php-fpm) S 1 1 1 0 -1" + us + "/usr/local/sbin/php-fpm (deleted)" + us + "php-fpm: pool www",
+            "P" + us + "9 (sh) S 7 1 1 0" + us + "/bin/dash" + us + "sh -c id",
+            "P" + us + "12 (weird) name) S 1 1" + us + "" + us + "",
+            "P" + us + "20 (apache2) S 1 20" + us + "/usr/sbin/apache2" + us + "apache2 -DFOREGROUND",
+            "M" + us + "20" + us + "/usr/lib/apache2/modules/libphp.so (deleted)",
+            "garbage line",
+        ])
+        procs = {p["pid"]: p for p in guard.parse_proc_snapshot(text)}
+        self.assertEqual(procs[1]["ppid"], 0)
+        self.assertIn("master process", procs[1]["cmdline"])
+        self.assertTrue(procs[7]["deleted"])
+        self.assertEqual(procs[7]["exe"], "/usr/local/sbin/php-fpm")
+        self.assertEqual(procs[12]["comm"], "weird) name")
+        self.assertIsNone(procs[12]["exe"])
+        self.assertEqual(procs[20]["php_modules"], ["/usr/lib/apache2/modules/libphp.so"])
+        self.assertTrue(procs[20]["module_deleted"])
+        shells = guard.find_shell_children(list(procs.values()))
+        self.assertEqual([(s["pid"], s["parent"]) for s in shells], [(9, "php-fpm[7]")])
+
+    def test_shell_children_debian_fpm_names(self):
+        procs = [{"pid": 2, "ppid": 1, "comm": "php-fpm8.3"}, {"pid": 3, "ppid": 2, "comm": "bash"},
+                 {"pid": 4, "ppid": 1, "comm": "cron"}, {"pid": 5, "ppid": 4, "comm": "sh"}]
+        self.assertEqual([s["pid"] for s in guard.find_shell_children(procs)], [3])
+
+    def test_layer_changes(self):
+        lines = ["C /etc", "A /etc/cron.d", "A /etc/cron.d/x", "C /var/www/html/index.php", "A /tmp/sess_abc",
+                 "A /var/www/html/up/a.php.jpg", "D /var/www/html/old.php", "A /usr/local/etc/php/conf.d/zz-php2shell-guard.ini",
+                 "A /root/.ssh/authorized_keys", "C /etc/passwd"]
+        php, persist = guard.classify_layer_changes(lines)
+        self.assertEqual(php, ["/var/www/html/index.php", "/var/www/html/up/a.php.jpg"])
+        self.assertEqual(persist, ["/etc/cron.d", "/etc/cron.d/x", "/root/.ssh/authorized_keys", "/etc/passwd"])
+
+    def test_apache_directive_lines(self):
+        self.assertEqual(guard.apache_directive("  php_admin_flag session.upload_progress.enabled off"),
+                         ("php_admin_flag", "session.upload_progress.enabled", "off"))
+        self.assertEqual(guard.apache_directive("RLimitMEM 268435456")[0], "rlimitmem")
+        self.assertIsNone(guard.apache_directive("# php_value memory_limit 1G"))
+        self.assertIsNone(guard.apache_directive("php_value include_path ."))
+
+    def test_container_fix_hints(self):
+        comp = {"project": "docker-multi-php", "service": "php74", "working_dir": "/s",
+                "config_files": "/s/docker-compose.yml"}
+        d = {"image": "docker-multi-php-php74", "compose": comp}
+        fix = guard.container_fix(d, {"version": "7.4.33", "kind": "fpm"})
+        self.assertIn("PHP 8.2+", fix)
+        self.assertIn("update FROM", fix)
+        self.assertIn("docker compose -f /s/docker-compose.yml build --pull php74", fix)
+        fix = guard.container_fix({"image": "php:8.3.20-fpm", "compose": None}, {"version": "8.3.20", "kind": "fpm"})
+        self.assertIn("PHP 8.3.36+", fix)
+        self.assertIn("php:8.3-fpm", fix)
+        self.assertNotIn("FROM", fix)
+
+
+class FakeContainer(object):
+    """In-memory stand-in for guard.Container (no docker needed)."""
+    join = staticmethod(guard.posixpath.join)
+
+    def __init__(self, files, dirs, phpinfo, version="PHP 8.3.20 (cli)"):
+        self.files, self.dirs, self.phpinfo, self.version = dict(files), set(dirs), phpinfo, version
+        self.name = "fake"
+
+    def run(self, cmd, timeout=20, stdin_data=None, binary=False):
+        if cmd[-1] == "-i":
+            return 0, self.phpinfo, ""
+        if cmd[-2:] == ["-n", "-v"]:
+            return 0, self.version, ""
+        return 1, "", "unsupported"
+
+    def which(self, name):
+        return None
+
+    def isfile(self, path):
+        return path in self.files
+
+    def isdir(self, path):
+        return path in self.dirs
+
+    def exists(self, path):
+        return path in self.files or path in self.dirs
+
+    def existing(self, patterns, kind="f"):
+        import fnmatch
+        pool = self.dirs if kind == "d" else self.files
+        return sorted(set(p for p in pool for pat in patterns if fnmatch.fnmatchcase(p, pat)))
+
+    def glob(self, pattern):
+        return self.existing([pattern], "f") + self.existing([pattern], "d")
+
+    def read_text(self, path):
+        return self.files.get(path)
+
+    def write_text(self, path, text, mode=None):
+        self.files[path] = text
+
+    def backup(self, path, bak):
+        self.files.setdefault(bak, self.files[path])
+
+    def remove(self, path):
+        self.files.pop(path, None)
+
+    def markers(self, path):
+        return set()
+
+    def bytes_version(self, path):
+        return None
+
+    def where(self, path):
+        return "fake:" + path
+
+
+class ProtectOnContainer(unittest.TestCase):
+    POOL = "[www]\nuser = www-data\npm = dynamic\n"
+    INFO = ("Loaded Configuration File => (none)\n"
+            "Scan this dir for additional .ini files => /usr/local/etc/php/conf.d\n")
+
+    def args(self, **kw):
+        import argparse
+        base = dict(post_max=None, upload_max=None, memory_unlimited=False, nesting=32, no_fpm_pools=False, no_apache=False)
+        base.update(kw)
+        return argparse.Namespace(**base)
+
+    def test_apply_then_rollback_restores_files(self):
+        import contextlib
+        import io
+        ct = FakeContainer({"/usr/local/etc/php-fpm.d/www.conf": self.POOL, "/usr/local/sbin/php-fpm": "ELF"},
+                           {"/usr/local/etc/php/conf.d", "/usr/local/etc/php-fpm.d"}, self.INFO)
+        bins = [{"path": "/usr/local/sbin/php-fpm", "sources": {"PATH"}}]
+        with contextlib.redirect_stdout(io.StringIO()):
+            planned, changes = guard.protect_target(self.args(post_max="32M", upload_max="30M"), ct, bins, apply_=True)
+        dropin = "/usr/local/etc/php/conf.d/" + guard.DROPIN_NAME
+        self.assertEqual(sorted(changes), sorted([dropin, "/usr/local/etc/php-fpm.d/www.conf"]))
+        self.assertIn("session.upload_progress.enabled = 0", ct.files[dropin])
+        self.assertIn("post_max_size = 32M", ct.files[dropin])
+        pool = ct.files["/usr/local/etc/php-fpm.d/www.conf"]
+        self.assertIn("php_admin_flag[session.upload_progress.enabled] = off", pool)
+        self.assertNotIn("fatal_error_backtraces", pool)  # 8.3 build
+        self.assertEqual(ct.files["/usr/local/etc/php-fpm.d/www.conf.php2shell-guard.bak"], self.POOL)
+        with contextlib.redirect_stdout(io.StringIO()):
+            n = guard.rollback_target(ct, bins, apply_=True)
+        self.assertEqual(n, 2)
+        self.assertNotIn(dropin, ct.files)
+        self.assertEqual(ct.files["/usr/local/etc/php-fpm.d/www.conf"].strip(), self.POOL.strip())
+
+    def test_dry_run_writes_nothing(self):
+        import contextlib
+        import io
+        ct = FakeContainer({"/usr/local/etc/php-fpm.d/www.conf": self.POOL}, {"/usr/local/etc/php/conf.d"}, self.INFO,
+                           version="PHP 8.5.3 (cli)")
+        before = dict(ct.files)
+        bins = [{"path": "/usr/local/sbin/php-fpm", "sources": {"PATH"}}]
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            planned, changes = guard.protect_target(self.args(), ct, bins, apply_=False)
+        self.assertEqual(changes, [])
+        self.assertEqual(ct.files, before)
+        self.assertIn("/usr/local/etc/php/conf.d/" + guard.DROPIN_NAME, planned)
+        self.assertIn("no Apache config dir found", out.getvalue())
+
+    def test_php85_container_pool_gets_backtraces_flag(self):
+        import contextlib
+        import io
+        ct = FakeContainer({"/usr/local/etc/php-fpm.d/www.conf": self.POOL}, {"/usr/local/etc/php/conf.d"}, self.INFO,
+                           version="PHP 8.5.3 (cli)")
+        with contextlib.redirect_stdout(io.StringIO()):
+            guard.protect_target(self.args(), ct, [{"path": "/usr/local/sbin/php-fpm", "sources": {"PATH"}}], apply_=True)
+        self.assertIn("php_admin_flag[fatal_error_backtraces] = off", ct.files["/usr/local/etc/php-fpm.d/www.conf"])
+
+
 if __name__ == "__main__":
     unittest.main()
