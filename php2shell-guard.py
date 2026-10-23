@@ -7,9 +7,11 @@ global state").
 
     scan     audit this host: every PHP binary, running worker, package and
              effective configuration, with a per-install verdict
+             (--docker: the same inside every running container)
     protect  apply (or roll back) the php.net-advised mitigations as drop-ins
+             (--docker: inside running containers)
     hunt     look for exploitation traces (logs, session files, webroots,
-             web-worker child processes, cron)
+             web-worker child processes, cron; --docker: in containers)
     remote   passive banner scan of your own hosts, optional WAF coverage check
     rules    print ModSecurity / nginx / Apache / HAProxy / Suricata snippets
 
@@ -23,15 +25,18 @@ from __future__ import print_function
 
 import argparse
 import concurrent.futures
+import contextlib
 import datetime
 import glob
 import gzip
 import hashlib
 import io
+import itertools
 import json
 import mmap
 import os
 import platform
+import posixpath
 import re
 import shutil
 import socket
@@ -39,12 +44,13 @@ import ssl
 import stat
 import subprocess
 import sys
+import tarfile
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 
-__version__ = "1.0.1"
+__version__ = "1.1.0"
 TOOL = "php2shell-guard"
 CVES = ("CVE-2026-109618", "CVE-2026-109619")
 ADVISORY_URL = "https://www.php.net/archive/2026.php#2026-10-21-5"
@@ -195,6 +201,11 @@ APACHE_CONF_DIRS = [
     "/etc/apache2", "/etc/httpd", "/usr/local/apache/conf", "/usr/local/etc/apache24",
     "/etc/apache24", "/opt/homebrew/etc/httpd", "/usr/local/etc/httpd", "/etc/httpd24",
 ]
+# Directories Apache includes automatically (protect writes its conf into the first one found).
+APACHE_INCLUDE_DIRS = (
+    "/etc/apache2/conf-available", "/etc/httpd/conf.d", "/usr/local/apache/conf/includes",
+    "/usr/local/etc/apache24/Includes", "/etc/apache24/Includes", "/opt/homebrew/etc/httpd/extra",
+)
 SESSION_DIR_CANDIDATES = [
     "/var/lib/php/sessions", "/var/lib/php/session", "/var/lib/php*/sessions",
     "/var/lib/php*/session", "/var/lib/php/*/sessions", "/var/opt/remi/php*/lib/php/session",
@@ -250,8 +261,9 @@ def is_root():
         return False
 
 
-def run(cmd, timeout=20, env_extra=None, stdin_data=None):
-    """Run a command, return (rc, stdout, stderr). Never raises."""
+def run(cmd, timeout=20, env_extra=None, stdin_data=None, binary=False):
+    """Run a command, return (rc, stdout, stderr). Never raises.
+    stdout stays bytes when binary is set."""
     env = dict(os.environ)
     env.setdefault("LC_ALL", "C")
     if env_extra:
@@ -259,9 +271,10 @@ def run(cmd, timeout=20, env_extra=None, stdin_data=None):
     try:
         p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout,
                            env=env, input=stdin_data)
-        return p.returncode, p.stdout.decode("utf-8", "replace"), p.stderr.decode("utf-8", "replace")
+        out = p.stdout if binary else p.stdout.decode("utf-8", "replace")
+        return p.returncode, out, p.stderr.decode("utf-8", "replace")
     except (OSError, subprocess.SubprocessError) as e:
-        return -1, "", str(e)
+        return -1, b"" if binary else "", str(e)
 
 
 def which(name):
@@ -273,6 +286,75 @@ def expand_globs(patterns):
     for p in patterns:
         out.extend(glob.glob(p))
     return out
+
+
+class HostContext(object):
+    """Commands and files on this machine. Container (see the Docker section)
+    offers the same methods through docker exec, so the scan / protect code
+    below works on either."""
+    name = None
+    join = staticmethod(os.path.join)
+
+    def run(self, cmd, timeout=20, stdin_data=None, binary=False):
+        return run(cmd, timeout=timeout, stdin_data=stdin_data, binary=binary)
+
+    def which(self, name):
+        return which(name)
+
+    def isfile(self, path):
+        return os.path.isfile(path)
+
+    def isdir(self, path):
+        return os.path.isdir(path)
+
+    def exists(self, path):
+        return os.path.exists(path)
+
+    def glob(self, pattern):
+        return glob.glob(pattern)
+
+    def existing(self, patterns, kind="f"):
+        test = os.path.isdir if kind == "d" else os.path.isfile
+        return sorted(set(p for p in expand_globs(patterns) if test(p)))
+
+    def read_text(self, path):
+        try:
+            with open(path, "r", errors="replace") as fh:
+                return fh.read()
+        except OSError:
+            return None
+
+    def read_bytes(self, path, limit):
+        try:
+            with open(path, "rb") as fh:
+                return fh.read(limit)
+        except OSError:
+            return None
+
+    def write_text(self, path, text, mode=None):
+        with open(path, "w") as fh:
+            fh.write(text)
+        if mode is not None:
+            os.chmod(path, mode)
+
+    def backup(self, path, bak):
+        if not os.path.exists(bak):
+            shutil.copy2(path, bak)
+
+    def remove(self, path):
+        os.remove(path)
+
+    def markers(self, path):
+        return read_marker_hits(path)
+
+    def bytes_version(self, path):
+        return version_from_bytes(path)
+
+    def where(self, path):
+        return path
+
+
+HOST = HostContext()
 
 
 # --------------------------------------------------------------------------
@@ -530,19 +612,20 @@ def binary_kind(path):
     return "cli"
 
 
-def php_version_of(path, kind):
+def php_version_of(path, kind, ctx=None):
+    ctx = ctx or HOST
     if kind == "module":
-        return version_from_bytes(path), "bytes"
+        return ctx.bytes_version(path), "bytes"
     if kind == "frankenphp":
-        rc, out, err = run([path, "version"], timeout=15)
+        rc, out, err = ctx.run([path, "version"], timeout=15)
         m = re.search(r"PHP (\d+\.\d+\.\d+\S*)", out + err)
         if m:
             return m.group(1), "frankenphp version"
-    rc, out, err = run([path, "-n", "-v"], timeout=15)
+    rc, out, err = ctx.run([path, "-n", "-v"], timeout=15)
     m = re.search(r"PHP (\d+\.\d+\.\d+[^\s]*)", out + err)
     if m:
         return m.group(1).rstrip(","), "-v"
-    v = version_from_bytes(path)
+    v = ctx.bytes_version(path)
     return v, "bytes" if v else "none"
 
 
@@ -617,7 +700,7 @@ def find_php_binaries():
             on_host = False
             try:
                 hs = os.stat(exe)
-                on_host = proc["exe_stat"] is None or (hs.st_dev, hs.st_ino) == proc["exe_stat"]
+                on_host = proc.get("exe_stat") is None or (hs.st_dev, hs.st_ino) == proc["exe_stat"]
             except OSError:
                 on_host = False
             if on_host:
@@ -754,24 +837,28 @@ def running_processes():
 # Package managers
 # --------------------------------------------------------------------------
 
-def changelog_mentions_cve(paths):
+def changelog_mentions_cve(paths, ctx=None):
+    ctx = ctx or HOST
     for p in paths:
-        try:
-            opener = gzip.open if p.endswith(".gz") else open
-            with opener(p, "rb") as fh:
-                data = fh.read(400000)
-            if re.search(rb"CVE-2026-10961[89]|php2shell", data, re.I):
-                return p
-        except OSError:
+        data = ctx.read_bytes(p, 8 * 1024 * 1024)
+        if not data:
             continue
+        if p.endswith(".gz"):
+            try:
+                data = gzip.GzipFile(fileobj=io.BytesIO(data)).read(400000)
+            except (OSError, EOFError):
+                continue
+        if re.search(rb"CVE-2026-10961[89]|php2shell", data[:400000], re.I):
+            return p
     return None
 
 
-def check_dpkg():
-    if not which("dpkg-query"):
+def check_dpkg(ctx=None):
+    ctx = ctx or HOST
+    if not ctx.which("dpkg-query"):
         return []
-    rc, out, _ = run(["dpkg-query", "-W", "-f=${Package}\t${Version}\t${db:Status-Status}\t${Source}\n", "php*",
-                      "libapache2-mod-php*"], timeout=30)
+    rc, out, _ = ctx.run(["dpkg-query", "-W", "-f=${Package}\t${Version}\t${db:Status-Status}\t${Source}\n", "php*",
+                          "libapache2-mod-php*"], timeout=30)
     if rc != 0:
         return []
     results = []
@@ -805,18 +892,19 @@ def check_dpkg():
                 status, how = "vulnerable", "upstream version %s predates the fix and no known backport matches" % up
         if status != "patched":
             cl = changelog_mentions_cve(["/usr/share/doc/%s/changelog.Debian.gz" % pkg,
-                                         "/usr/share/doc/%s/changelog.gz" % pkg])
+                                         "/usr/share/doc/%s/changelog.gz" % pkg], ctx)
             if cl:
                 status, how = "patched", "changelog references the CVE (%s)" % cl
         results.append({"manager": "dpkg", "package": pkg, "version": ver, "status": status, "detail": how})
     return results
 
 
-def check_rpm():
-    if not which("rpm"):
+def check_rpm(ctx=None):
+    ctx = ctx or HOST
+    if not ctx.which("rpm"):
         return []
-    rc, out, _ = run(["rpm", "-qa", "--qf", "%{NAME}\t%{EPOCH}\t%{VERSION}-%{RELEASE}\n",
-                      "php*", "*-php", "*-php-common", "*-php-fpm", "*-php-cli", "plesk-php*", "ea-php*"], timeout=40)
+    rc, out, _ = ctx.run(["rpm", "-qa", "--qf", "%{NAME}\t%{EPOCH}\t%{VERSION}-%{RELEASE}\n",
+                          "php*", "*-php", "*-php-common", "*-php-fpm", "*-php-cli", "plesk-php*", "ea-php*"], timeout=40)
     if rc != 0:
         return []
     results, seen = [], set()
@@ -832,7 +920,7 @@ def check_rpm():
             continue
         seen.add(key)
         status, how = "unknown", "build not in the known-fixed table"
-        rc2, cl, _ = run(["rpm", "-q", "--changelog", name], timeout=30)
+        rc2, cl, _ = ctx.run(["rpm", "-q", "--changelog", name], timeout=30)
         if rc2 == 0 and re.search(r"CVE-2026-10961[89]|php2shell", cl, re.I):
             status, how = "patched", "rpm changelog references the CVE"
         else:
@@ -852,10 +940,11 @@ def check_rpm():
     return results
 
 
-def check_apk():
-    if not which("apk"):
+def check_apk(ctx=None):
+    ctx = ctx or HOST
+    if not ctx.which("apk"):
         return []
-    rc, out, _ = run(["apk", "info", "-v"], timeout=30)
+    rc, out, _ = ctx.run(["apk", "info", "-v"], timeout=30)
     results = []
     for line in out.splitlines():
         m = re.match(r"^(php\d\d(?:-(?:fpm|cgi|common|phpdbg))?)-(\d+\.\d+\.\d+)(-r\d+)$", line.strip())
@@ -868,10 +957,11 @@ def check_apk():
     return results
 
 
-def check_pacman():
-    if not which("pacman"):
+def check_pacman(ctx=None):
+    ctx = ctx or HOST
+    if not ctx.which("pacman"):
         return []
-    rc, out, _ = run(["pacman", "-Q"], timeout=30)
+    rc, out, _ = ctx.run(["pacman", "-Q"], timeout=30)
     results = []
     for line in out.splitlines():
         m = re.match(r"^(php(?:-legacy|\d\d)?(?:-fpm|-cgi)?)\s+(\S+)$", line.strip())
@@ -898,11 +988,13 @@ def check_brew():
     return results
 
 
-def check_packages():
+def check_packages(ctx=None):
+    ctx = ctx or HOST
     out = []
-    for fn in (check_dpkg, check_rpm, check_apk, check_pacman, check_brew):
+    checks = (check_dpkg, check_rpm, check_apk, check_pacman) + ((check_brew,) if ctx is HOST else ())
+    for fn in checks:
         try:
-            out.extend(fn())
+            out.extend(fn() if fn is check_brew else fn(ctx))
         except Exception as e:  # pragma: no cover - defensive
             out.append({"manager": fn.__name__, "package": "?", "version": "?", "status": "unknown", "detail": "error: %s" % e})
     return out
@@ -959,66 +1051,67 @@ def parse_phpinfo_text(text):
     return conf, info
 
 
-def effective_ini_from_binary(path, kind):
+def effective_ini_from_binary(path, kind, ctx=None):
     """Ask the binary itself for its effective configuration (`-i`)."""
+    ctx = ctx or HOST
     if kind == "module":
         return None, None, "module (no executable)"
     if kind == "frankenphp":
-        rc, out, err = run([path, "php-cli", "-i"], timeout=20)
+        rc, out, err = ctx.run([path, "php-cli", "-i"], timeout=20)
     else:
-        rc, out, err = run([path, "-i"], timeout=20)
+        rc, out, err = ctx.run([path, "-i"], timeout=20)
     if rc != 0 and "=>" not in out:
         return None, None, (err.strip().splitlines() or ["-i failed"])[-1]
     conf, info = parse_phpinfo_text(out)
     return conf, info, None
 
 
-def parse_ini_file(path):
+def parse_ini_text(text):
     vals = {}
-    try:
-        with open(path, "r", errors="replace") as fh:
-            for raw in fh:
-                line = raw.strip()
-                if not line or line[0] in ";#[":
-                    continue
-                m = re.match(r"^([\w.]+)\s*=\s*(.*?)\s*(?:;.*)?$", line)
-                if m:
-                    vals[m.group(1)] = m.group(2).strip().strip('"')
-    except OSError:
-        pass
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line or line[0] in ";#[":
+            continue
+        m = re.match(r"^([\w.]+)\s*=\s*(.*?)\s*(?:;.*)?$", line)
+        if m:
+            vals[m.group(1)] = m.group(2).strip().strip('"')
     return vals
 
 
-def resolve_static_ini(ini_file, scan_dir):
+def parse_ini_file(path, ctx=None):
+    return parse_ini_text((ctx or HOST).read_text(path))
+
+
+def resolve_static_ini(ini_file, scan_dir, ctx=None):
     """Resolve php.ini + scan dir drop-ins the way PHP does (alphabetical)."""
+    ctx = ctx or HOST
     vals, files = {}, []
-    if ini_file and os.path.isfile(ini_file):
-        vals.update(parse_ini_file(ini_file))
+    if ini_file and ctx.isfile(ini_file):
+        vals.update(parse_ini_file(ini_file, ctx))
         files.append(ini_file)
-    if scan_dir and os.path.isdir(scan_dir):
-        for f in sorted(glob.glob(os.path.join(scan_dir, "*.ini"))):
-            vals.update(parse_ini_file(f))
+    if scan_dir and ctx.isdir(scan_dir):
+        for f in sorted(ctx.glob(ctx.join(scan_dir, "*.ini"))):
+            vals.update(parse_ini_file(f, ctx))
             files.append(f)
     conf = {k: (v, v) for k, v in vals.items() if k in INI_KEYS}
     return conf, files
 
 
-def sapi_ini_dirs_for(path):
+def sapi_ini_dirs_for(path, ctx=None):
     """For a binary, guess sibling per-SAPI ini dirs (Debian layout)."""
+    ctx = ctx or HOST
     out = []
     m = re.search(r"/etc/php/(\d\.\d)/", path)
     if m:
         for s in ("apache2", "fpm", "cgi", "litespeed", "embed"):
             d = "/etc/php/%s/%s" % (m.group(1), s)
-            if os.path.isdir(d):
-                out.append((s, os.path.join(d, "php.ini"), os.path.join(d, "conf.d")))
+            if ctx.isdir(d):
+                out.append((s, ctx.join(d, "php.ini"), ctx.join(d, "conf.d")))
     return out
 
 
-def fpm_pool_overrides(fpm_bin):
-    """Dump FPM config with -tt and collect per-pool overrides."""
-    rc, out, err = run([fpm_bin, "-tt"], timeout=20)
-    text = out + err
+def parse_fpm_tt(text):
+    """Per-pool php_* overrides and pm settings from `php-fpm -tt` output."""
     pools, cur = {}, None
     for line in text.splitlines():
         m = re.search(r"NOTICE: \[([^\]]+)\]\s*$", line)
@@ -1035,8 +1128,36 @@ def fpm_pool_overrides(fpm_bin):
         m = re.search(r"NOTICE:\s+(pm\.max_requests|pm|pm\.max_children|listen|user)\s*=\s*(.*)$", line)
         if m:
             pools[cur][m.group(1)] = ("setting", m.group(2).strip())
+    return pools
+
+
+def fpm_pool_overrides(fpm_bin, ctx=None):
+    """Dump FPM config with -tt and collect per-pool overrides."""
+    rc, out, err = (ctx or HOST).run([fpm_bin, "-tt"], timeout=20)
+    text = out + err
+    pools = parse_fpm_tt(text)
     ok = rc == 0 and ("test is successful" in text or pools)
     return pools, ok, (text.strip().splitlines() or [""])[-1]
+
+
+APACHE_PHP_DIRECTIVE_RE = re.compile(r"(php_(?:admin_)?(?:value|flag))\s+(session\.upload_progress\.enabled|memory_limit|post_max_size|upload_max_filesize|fatal_error_backtraces|max_input_nesting_level)\s+(\S+)", re.I)
+
+
+def apache_directive(line):
+    """(kind, key, value) for an Apache line this tool cares about, else None."""
+    s = line.strip()
+    if not s or s.startswith("#"):
+        return None
+    m = APACHE_PHP_DIRECTIVE_RE.match(s)
+    if m:
+        return m.group(1).lower(), m.group(2).lower(), m.group(3)
+    m = re.match(r"(RLimitMEM)\s+(.*)", s, re.I)
+    if m:
+        return "rlimitmem", "RLimitMEM", m.group(2)
+    m = re.match(r"(LimitRequestBody)\s+(\d+)", s, re.I)
+    if m:
+        return "limitrequestbody", "LimitRequestBody", m.group(2)
+    return None
 
 
 def scan_apache_configs():
@@ -1049,22 +1170,15 @@ def scan_apache_configs():
         try:
             with open(conf, "r", errors="replace") as fh:
                 for n, line in enumerate(fh, 1):
-                    s = line.strip()
-                    if not s or s.startswith("#"):
+                    d = apache_directive(line)
+                    if not d:
                         continue
-                    m = re.match(r"(php_(?:admin_)?(?:value|flag))\s+(session\.upload_progress\.enabled|memory_limit|post_max_size|upload_max_filesize|fatal_error_backtraces|max_input_nesting_level)\s+(\S+)", s, re.I)
-                    if m:
-                        key = (real, m.group(1).lower(), m.group(2).lower(), m.group(3).lower())
+                    if d[0].startswith("php_"):
+                        key = (real, d[0], d[1], d[2].lower())
                         if key in seen_keys:
                             continue
                         seen_keys.add(key)
-                        findings.append({"file": conf, "line": n, "kind": m.group(1).lower(), "key": m.group(2).lower(), "value": m.group(3)})
-                    m = re.match(r"(RLimitMEM)\s+(.*)", s, re.I)
-                    if m:
-                        findings.append({"file": conf, "line": n, "kind": "rlimitmem", "key": "RLimitMEM", "value": m.group(2)})
-                    m = re.match(r"(LimitRequestBody)\s+(\d+)", s, re.I)
-                    if m:
-                        findings.append({"file": conf, "line": n, "kind": "limitrequestbody", "key": "LimitRequestBody", "value": m.group(2)})
+                    findings.append({"file": conf, "line": n, "kind": d[0], "key": d[1], "value": d[2]})
         except OSError:
             continue
     return findings
@@ -1074,7 +1188,8 @@ def scan_apache_configs():
 # scan
 # --------------------------------------------------------------------------
 
-def assess_install(entry, procs, pkgs, no_config=False):
+def assess_install(entry, procs, pkgs, no_config=False, ctx=None):
+    ctx = ctx or HOST
     path = entry["path"]
     nsroot = bool(entry.get("nsroot"))
     display = entry.get("display", path)
@@ -1092,17 +1207,17 @@ def assess_install(entry, procs, pkgs, no_config=False):
         # never execute a foreign namespace's binary; read it instead
         ver, how = version_from_bytes(path), "bytes"
     else:
-        ver, how = php_version_of(path, kind)
+        ver, how = php_version_of(path, kind, ctx)
     res["version"], res["version_source"] = ver, how
     st, why = classify_version(ver or "")
     res["version_status"], res["version_reason"] = st, why
-    res["fingerprint"] = sorted(read_marker_hits(path))
+    res["fingerprint"] = sorted(ctx.markers(path))
 
     if nsroot:
         res["running"] = sorted(entry.get("pids", []))
         pidset = set(res["running"])
         res["stale_running"] = any(p["deleted"] for p in procs if p["pid"] in pidset)
-        res["config_note"] = "inside a container (pid %s%s); run scan in that container for ini/pool checks" % (
+        res["config_note"] = "inside a container (pid %s%s); run `scan --docker` or scan in that container for ini/pool checks" % (
             res["running"][0] if res["running"] else "?", ", id %s" % res["container"] if res["container"] and res["container"] != "yes" else "")
         no_config = True
     for p in procs:
@@ -1113,7 +1228,7 @@ def assess_install(entry, procs, pkgs, no_config=False):
 
     # effective config
     if not no_config:
-        conf, info, note = effective_ini_from_binary(path, kind)
+        conf, info, note = effective_ini_from_binary(path, kind, ctx)
         res["config_note"] = note
         if conf is not None:
             res["config"] = {k: v[0] for k, v in conf.items()}
@@ -1125,12 +1240,15 @@ def assess_install(entry, procs, pkgs, no_config=False):
             if m:
                 cands.append(("apache2", "/etc/php/%s/apache2/php.ini" % m.group(1), "/etc/php/%s/apache2/conf.d" % m.group(1)))
             for pat in ("/etc/php/*/apache2",):
-                for d in glob.glob(pat):
+                for d in ctx.glob(pat):
                     cands.append(("apache2", d + "/php.ini", d + "/conf.d"))
-            if os.path.isfile("/etc/php.ini"):
+            if ctx.isfile("/etc/php.ini"):
                 cands.append(("apache2", "/etc/php.ini", "/etc/php.d"))
+            if ctx.isdir("/usr/local/etc/php"):
+                # Docker official php:*-apache images
+                cands.append(("apache2", "/usr/local/etc/php/php.ini", "/usr/local/etc/php/conf.d"))
             for sapi, ini, scan in cands:
-                c_, files = resolve_static_ini(ini, scan)
+                c_, files = resolve_static_ini(ini, scan, ctx)
                 if files:
                     res["config"] = {k: v[0] for k, v in c_.items()}
                     # PHP defaults for directives the ini files leave commented out
@@ -1139,12 +1257,12 @@ def assess_install(entry, procs, pkgs, no_config=False):
                     res["config_note"] = "static parse of %s (+%d drop-ins)" % (ini, len(files) - 1)
                     break
         if kind == "cli":
-            for sapi, ini, scan in sapi_ini_dirs_for(res.get("config_files", {}).get("ini_file") or ""):
-                c_, files = resolve_static_ini(ini, scan)
+            for sapi, ini, scan in sapi_ini_dirs_for((res.get("config_files") or {}).get("ini_file") or "", ctx):
+                c_, files = resolve_static_ini(ini, scan, ctx)
                 if files:
                     res["sapi_configs"].append({"sapi": sapi, "ini_file": ini, "config": {k: v[0] for k, v in c_.items()}})
         if kind == "fpm":
-            pools, ok, last = fpm_pool_overrides(path)
+            pools, ok, last = fpm_pool_overrides(path, ctx)
             res["fpm_pools"] = {"pools": pools, "ok": ok, "note": last}
 
     # verdict
@@ -1212,11 +1330,85 @@ def config_findings(conf, context, verdict):
     return out
 
 
+HOST_UNPATCHED_FIX = "update to the fixed release for the branch and restart every worker"
+
+
+def install_findings(inst, prefix="", unpatched_fix=HOST_UNPATCHED_FIX):
+    """Findings for one assessed install. prefix names the container, if any."""
+    where = (prefix + ":" if prefix else "") + inst["path"]
+    label = "%s (%s)" % (where, inst["kind"])
+    pool_prefix = prefix + ": " if prefix else ""
+    out = []
+    for f in inst["findings"]:
+        out.append((f[0], label + ": " + f[1], f[2]))
+    if inst["verdict"] == "VULNERABLE":
+        out.append(("CRITICAL", "%s is unpatched (PHP %s, %s)" % (label, inst["version"], inst["version_reason"]), unpatched_fix))
+    elif inst["verdict"] == "UNKNOWN":
+        out.append(("MEDIUM", "%s: could not determine patch status" % label, "check manually"))
+    out.extend(config_findings(inst.get("config"), label, inst["verdict"]))
+    for sc in inst.get("sapi_configs", []):
+        out.extend(config_findings(sc["config"], "%s [%s sapi: %s]" % (where, sc["sapi"], sc["ini_file"]), inst["verdict"]))
+    fp = inst.get("fpm_pools")
+    if fp and fp["pools"]:
+        for pool, vals in fp["pools"].items():
+            if pool.lower() in ("general", "global"):
+                continue
+            v = vals.get("session.upload_progress.enabled")
+            if v and ini_bool(v[1]) is False:
+                out.append(("OK", "%sFPM pool [%s] enforces session.upload_progress.enabled=off via %s" % (pool_prefix, pool, v[0]), ""))
+            mlv = vals.get("memory_limit")
+            if mlv and inst["verdict"] != "PATCHED" and mlv[1].strip() != "-1":
+                out.append(("LOW", "%sFPM pool [%s] sets memory_limit=%s (%s)" % (pool_prefix, pool, mlv[1], mlv[0]),
+                            "a pool-level finite limit overrides any php.ini memory_limit=-1 mitigation"))
+            mr = vals.get("pm.max_requests")
+            if mr and inst["verdict"] != "PATCHED" and mr[1].strip() == "0":
+                out.append(("LOW", "%sFPM pool [%s] pm.max_requests=0 (workers never recycle)" % (pool_prefix, pool),
+                            "a low pm.max_requests shortens how long stale state can persist in a worker"))
+    elif fp and not fp["ok"]:
+        out.append(("INFO", "%s: could not dump FPM pools (%s)" % (where, fp["note"]), "run as root"))
+    return out
+
+
+def package_findings(pkgs, prefix=""):
+    pre = prefix + ": " if prefix else ""
+    out = []
+    for pk in pkgs:
+        if pk["status"] == "vulnerable":
+            out.append(("CRITICAL", "%spackage %s %s is unpatched (%s)" % (pre, pk["package"], pk["version"], pk["detail"]),
+                        "apply the vendor update" + (" and rebuild the image" if prefix else "")))
+        elif pk["status"] == "unknown":
+            out.append(("MEDIUM", "%spackage %s %s: patch status not confirmed (%s)" % (pre, pk["package"], pk["version"], pk["detail"]),
+                        "compare with your vendor advisory"))
+    return out
+
+
+def apache_findings(directives, prefix=""):
+    pre = prefix + ":" if prefix else ""
+    out = []
+    for a in directives:
+        loc = "%s%s:%d" % (pre, a["file"], a["line"])
+        if a["kind"] == "rlimitmem":
+            out.append(("MEDIUM", "Apache RLimitMEM in %s" % loc,
+                        "php.net advises against RLIMIT_AS/RLIMIT_DATA style limits: they can cause the allocation failure the bug depends on"))
+        elif a["key"] == "session.upload_progress.enabled" and ini_bool(a["value"]) is False:
+            out.append(("OK", "Apache %s disables session.upload_progress in %s" % (a["kind"], loc), ""))
+        elif a["key"] == "session.upload_progress.enabled":
+            out.append(("HIGH", "Apache %s re-enables session.upload_progress in %s" % (a["kind"], loc), "remove it"))
+        elif a["key"] == "memory_limit" and a["kind"] in ("php_value", "php_admin_value"):
+            if a["value"].strip() == "-1":
+                out.append(("OK", "Apache %s memory_limit -1 in %s" % (a["kind"], loc), ""))
+            else:
+                out.append(("INFO", "Apache %s memory_limit %s in %s" % (a["kind"], a["value"], loc),
+                            "per-directory limits override a global memory_limit=-1 mitigation"))
+    return out
+
+
 def cmd_scan(args):
     t0 = time.time()
+    docker = args.docker or bool(args.container)
     report = {"tool": TOOL, "version": __version__, "host": socket.gethostname(), "time": datetime.datetime.now().isoformat(),
               "platform": platform.platform(), "root": is_root(), "installs": [], "packages": [], "apache": [],
-              "docker": [], "findings": [], "verdict": None}
+              "docker": [], "docker_error": None, "findings": [], "verdict": None}
     procs = running_processes()
     pkgs = check_packages()
     report["packages"] = pkgs
@@ -1227,73 +1419,27 @@ def cmd_scan(args):
     # Apache directives
     report["apache"] = scan_apache_configs()
     report["docker_auto"] = False
-    if args.docker:
-        report["docker"] = scan_docker()
+    if docker:
+        report["docker"], report["docker_error"] = scan_docker(args.container, no_config=args.no_config)
     elif not any(not i.get("proc_root") for i in report["installs"]) and which("docker"):
-        # nothing on the host itself: PHP is probably inside containers
-        report["docker"] = scan_docker()
+        # nothing on the host itself: PHP is probably inside containers. Cheap pass
+        # (no ini / pool checks); --docker does the deep one.
+        report["docker"], report["docker_error"] = scan_docker(None, no_config=True)
         report["docker_auto"] = True
+    report["installs"], report["proc_covered"] = dedupe_proc_installs(report["installs"], report["docker"])
     report["hints"] = no_php_hints(report) if not report["installs"] else []
 
     # aggregate findings
     findings = []
     for inst in report["installs"]:
-        ctx = "%s (%s)" % (inst["path"], inst["kind"])
-        for f in inst["findings"]:
-            findings.append((f[0], ctx + ": " + f[1], f[2]))
-        if inst["verdict"] == "VULNERABLE":
-            findings.append(("CRITICAL", "%s is unpatched (PHP %s, %s)" % (ctx, inst["version"], inst["version_reason"]),
-                             "update to the fixed release for the branch and restart every worker"))
-        elif inst["verdict"] == "UNKNOWN":
-            findings.append(("MEDIUM", "%s: could not determine patch status" % ctx, "check manually"))
-        findings.extend(config_findings(inst.get("config"), ctx, inst["verdict"]))
-        for sc in inst.get("sapi_configs", []):
-            findings.extend(config_findings(sc["config"], "%s [%s sapi: %s]" % (inst["path"], sc["sapi"], sc["ini_file"]), inst["verdict"]))
-        fp = inst.get("fpm_pools")
-        if fp and fp["pools"]:
-            for pool, vals in fp["pools"].items():
-                if pool.lower() in ("general", "global"):
-                    continue
-                v = vals.get("session.upload_progress.enabled")
-                if v and ini_bool(v[1]) is False:
-                    findings.append(("OK", "FPM pool [%s] enforces session.upload_progress.enabled=off via %s" % (pool, v[0]), ""))
-                mlv = vals.get("memory_limit")
-                if mlv and inst["verdict"] != "PATCHED" and mlv[1].strip() != "-1":
-                    findings.append(("LOW", "FPM pool [%s] sets memory_limit=%s (%s)" % (pool, mlv[1], mlv[0]),
-                                     "a pool-level finite limit overrides any php.ini memory_limit=-1 mitigation"))
-                mr = vals.get("pm.max_requests")
-                if mr and inst["verdict"] != "PATCHED" and mr[1].strip() == "0":
-                    findings.append(("LOW", "FPM pool [%s] pm.max_requests=0 (workers never recycle)" % pool,
-                                     "a low pm.max_requests shortens how long stale state can persist in a worker"))
-        elif fp and not fp["ok"]:
-            findings.append(("INFO", "%s: could not dump FPM pools (%s)" % (inst["path"], fp["note"]), "run as root"))
-    for pk in pkgs:
-        if pk["status"] == "vulnerable":
-            findings.append(("CRITICAL", "package %s %s is unpatched (%s)" % (pk["package"], pk["version"], pk["detail"]),
-                             "apply the vendor update"))
-        elif pk["status"] == "unknown":
-            findings.append(("MEDIUM", "package %s %s: patch status not confirmed (%s)" % (pk["package"], pk["version"], pk["detail"]),
-                             "compare with your vendor advisory"))
-    for a in report["apache"]:
-        if a["kind"] == "rlimitmem":
-            findings.append(("MEDIUM", "Apache RLimitMEM in %s:%d" % (a["file"], a["line"]),
-                             "php.net advises against RLIMIT_AS/RLIMIT_DATA style limits: they can cause the allocation failure the bug depends on"))
-        elif a["key"] == "session.upload_progress.enabled" and ini_bool(a["value"]) is False:
-            findings.append(("OK", "Apache %s disables session.upload_progress in %s:%d" % (a["kind"], a["file"], a["line"]), ""))
-        elif a["key"] == "session.upload_progress.enabled":
-            findings.append(("HIGH", "Apache %s re-enables session.upload_progress in %s:%d" % (a["kind"], a["file"], a["line"]), "remove it"))
-        elif a["key"] == "memory_limit" and a["kind"] in ("php_value", "php_admin_value"):
-            if a["value"].strip() == "-1":
-                findings.append(("OK", "Apache %s memory_limit -1 in %s:%d" % (a["kind"], a["file"], a["line"]), ""))
-            else:
-                findings.append(("INFO", "Apache %s memory_limit %s in %s:%d" % (a["kind"], a["value"], a["file"], a["line"]),
-                                 "per-directory limits override a global memory_limit=-1 mitigation"))
+        findings.extend(install_findings(inst))
+    findings.extend(package_findings(pkgs))
+    findings.extend(apache_findings(report["apache"]))
     for d in report["docker"]:
-        if d["verdict"] == "VULNERABLE":
-            findings.append(("CRITICAL", "container %s (%s) runs unpatched PHP %s" % (d["name"], d["image"], d["version"]),
-                             "rebuild with a fixed base image and recreate the container"))
-        elif d["verdict"] == "UNKNOWN":
-            findings.append(("MEDIUM", "container %s (%s): PHP patch status unknown" % (d["name"], d["image"]), ""))
+        findings.extend(container_findings(d))
+    if report["docker_error"]:
+        findings.append(("MEDIUM", "Docker containers not (fully) inspected: %s" % report["docker_error"],
+                         "check `docker ps` works for this user"))
     if not report["installs"] and not report["docker"]:
         findings.append(("INFO", "no PHP binaries or Apache PHP modules found on this host", ""))
     for h in report.get("hints", []):
@@ -1301,13 +1447,15 @@ def cmd_scan(args):
 
     findings.sort(key=lambda f: SEV_RANK.get(f[0], 9))
     report["findings"] = [{"severity": s, "title": t, "fix": x} for s, t, x in findings]
-    if any(i["verdict"] == "VULNERABLE" for i in report["installs"]) or any(d["verdict"] == "VULNERABLE" for d in report["docker"]) \
-            or any(p["status"] == "vulnerable" for p in pkgs):
+    units = report["installs"] + report["docker"]
+    if any(u["verdict"] == "VULNERABLE" for u in units) or any(p["status"] == "vulnerable" for p in pkgs):
         report["verdict"] = "VULNERABLE"
-    elif any(i["verdict"] == "UNKNOWN" for i in report["installs"]) or any(p["status"] == "unknown" for p in pkgs):
-        report["verdict"] = "PATCHED" if (report["installs"] and all(i["verdict"] == "PATCHED" for i in report["installs"])) else "UNKNOWN"
-    elif report["installs"] or report["docker"]:
+    elif any(u["verdict"] == "UNKNOWN" for u in units) or (docker and report["docker_error"]):
+        report["verdict"] = "UNKNOWN"
+    elif units:
         report["verdict"] = "PATCHED"
+    elif any(p["status"] == "unknown" for p in pkgs):
+        report["verdict"] = "UNKNOWN"
     else:
         report["verdict"] = "NO_PHP"
     report["elapsed"] = round(time.time() - t0, 2)
@@ -1322,64 +1470,141 @@ def cmd_scan(args):
     return {"VULNERABLE": 1, "UNKNOWN": 2, "PATCHED": 0, "NO_PHP": 0}[report["verdict"]]
 
 
+def dedupe_proc_installs(installs, docker_results):
+    """Runtimes seen from the host through /proc that `scan_docker` also
+    covered are reported once, in the Docker section. Returns
+    (remaining host installs, covered entries)."""
+    remaining, covered = [], []
+    for inst in installs:
+        if not inst.get("proc_root"):
+            remaining.append(inst)
+            continue
+        cid = inst.get("container")
+        hit = None
+        for d in docker_results:
+            if cid and cid != "yes" and d.get("id") and d["id"][:12] == cid[:12]:
+                hit = d
+                break
+            if any(di["path"] == inst["path"] and di["kind"] == inst["kind"] and di.get("version") == inst.get("version")
+                   and sorted(di.get("fingerprint") or []) == sorted(inst.get("fingerprint") or [])
+                   for di in d.get("installs", [])):
+                hit = d
+                break
+        if hit is None:
+            remaining.append(inst)
+            continue
+        inst["covered_by"] = hit["name"]
+        hit.setdefault("proc_pids", []).extend(inst.get("running", []))
+        covered.append(inst)
+    return remaining, covered
+
+
+def no_php_hints(report):
+    """Explain a NO_PHP result: what else is on the box that could still
+    front a PHP runtime somewhere else."""
+    hints = []
+    procs = running_processes()
+    web = sorted(set(p["comm"] for p in procs if p["comm"] in ("nginx", "apache2", "httpd", "caddy", "litespeed", "lshttpd")
+                     and not p.get("container")))
+    if web:
+        hints.append("web server running without a local PHP runtime (%s): it may proxy to containers, Kubernetes pods or another host; "
+                     "scan those" % ", ".join(web))
+    if which("docker"):
+        if report.get("docker_error"):
+            hints.append("docker: %s; PHP containers would not be visible" % report["docker_error"])
+        elif report.get("docker_auto"):
+            hints.append("no PHP on the host, so running containers were inspected automatically (cheap pass; `--docker` adds ini, pools and packages)")
+    for tool in ("podman", "kubectl", "ctr", "crictl"):
+        if which(tool):
+            hints.append("%s is installed: workloads under it are not inspected through docker; run scan inside those containers/pods" % tool)
+    if which("snap"):
+        rc, out, _ = run(["snap", "list"], timeout=20)
+        if rc == 0 and re.search(r"(?m)^(nextcloud|wordpress|php)", out):
+            hints.append("a snap bundles its own PHP (see `snap list`); check its upstream for the fixed revision")
+    if os.name != "nt" and os.path.isdir("/proc") and not is_root():
+        hints.append("not root: binaries behind other users' processes (including containers) may be invisible")
+    return hints
+
+
+def print_install(i, pad="  "):
+    col = {"PATCHED": "green", "VULNERABLE": "red"}.get(i["verdict"], "yellow")
+    fp = ",".join(i["fingerprint"]) if i["fingerprint"] else "none"
+    running = ("running pid " + ",".join(map(str, i["running"][:6])) + (" ..." if len(i["running"]) > 6 else "")) if i["running"] else "not running"
+    if i["stale_running"]:
+        running += c(" STALE BINARY", "red")
+    where = ""
+    if i.get("proc_root"):
+        where = c("  [container%s via %s]" % (" " + i["container"] if i.get("container") and i["container"] != "yes" else "",
+                                             i["proc_root"].split("/root")[0]), "cyan")
+    print("%s%s %s%s" % (pad, c("%-10s" % i["verdict"], col), i["path"], where))
+    if i["verdict"] == "PATCHED" and i["version_status"] in ("vulnerable", "eol") and i["fingerprint"]:
+        status_line = "status=backported (version string predates the fix; patch markers confirm the build)"
+    else:
+        status_line = "status=%s: %s" % (i["version_status"], i["version_reason"])
+    pad2 = pad + "    "
+    print("%skind=%s  version=%s (%s)  %s" % (pad2, i["kind"], i["version"], i["version_source"], status_line))
+    print("%spatch-markers=%s  %s  found-via=%s" % (pad2, fp, running, ",".join(i["sources"])))
+    conf = i.get("config")
+    if conf:
+        keys = [("session.upload_progress.enabled", "upload_progress"), ("fatal_error_backtraces", "fatal_error_backtraces"),
+                ("memory_limit", "memory_limit"), ("memory_hard_limit_percent", "hard_limit%"), ("post_max_size", "post_max_size"),
+                ("upload_max_filesize", "upload_max_filesize"), ("max_input_nesting_level", "nesting")]
+        print(pad2 + "ini: " + "  ".join("%s=%s" % (label, conf[k]) for k, label in keys if k in conf and conf[k] != "no value"))
+        cf = i.get("config_files") or {}
+        if cf.get("ini_file") or cf.get("scan_dir"):
+            print("%sini-files: %s  scan-dir: %s" % (pad2, cf.get("ini_file") or "(none)", cf.get("scan_dir") or "(none)"))
+    elif i.get("config_note"):
+        print("%sini: %s" % (pad2, i["config_note"]))
+    for sc in i.get("sapi_configs", []):
+        print("%s[%s sapi] upload_progress=%s memory_limit=%s post_max_size=%s (%s)" % (
+            pad2, sc["sapi"], sc["config"].get("session.upload_progress.enabled", "?"), sc["config"].get("memory_limit", "?"),
+            sc["config"].get("post_max_size", "?"), sc["ini_file"]))
+    fp_ = i.get("fpm_pools")
+    if fp_ and fp_["pools"]:
+        for pool, vals in fp_["pools"].items():
+            if pool.lower() in ("general", "global"):
+                continue
+            ov = ["%s[%s]=%s" % (v[0], k, v[1]) for k, v in vals.items() if v[0] != "setting"]
+            pm = vals.get("pm.max_requests", ("", "?"))[1]
+            print("%sfpm pool [%s]: pm.max_requests=%s %s" % (pad2, pool, pm, " ".join(ov) if ov else "(no php_* overrides)"))
+
+
+def print_packages(pkgs, pad="  "):
+    for p in pkgs:
+        col = {"patched": "green", "vulnerable": "red"}.get(p["status"], "yellow")
+        print("%s%s %-6s %-28s %-40s %s" % (pad, c("%-10s" % p["status"].upper(), col), p["manager"], p["package"], p["version"], p["detail"]))
+
+
 def print_scan_report(r):
     banner("%s %s - local audit of %s" % (TOOL, __version__, r["host"]))
     print("  %s | root=%s | %s" % (r["platform"], r["root"], r["time"]))
-    if not r["root"]:
+    if not r["root"] and (r["installs"] or not r["docker"]):
         print(c("  not running as root: process maps, FPM pool dumps and some binaries may be unreadable", "yellow"))
     print()
-    banner("PHP runtimes (%d)" % len(r["installs"]))
+    banner("PHP runtimes on this host (%d)" % len(r["installs"]))
     for i in r["installs"]:
-        col = {"PATCHED": "green", "VULNERABLE": "red"}.get(i["verdict"], "yellow")
-        fp = ",".join(i["fingerprint"]) if i["fingerprint"] else "none"
-        running = ("running pid " + ",".join(map(str, i["running"][:6])) + (" ..." if len(i["running"]) > 6 else "")) if i["running"] else "not running"
-        if i["stale_running"]:
-            running += c(" STALE BINARY", "red")
-        where = ""
-        if i.get("proc_root"):
-            where = c("  [container%s via %s]" % (" " + i["container"] if i.get("container") and i["container"] != "yes" else "", i["proc_root"].split("/root")[0]), "cyan")
-        print("  %s %s%s" % (c("%-10s" % i["verdict"], col), i["path"], where))
-        if i["verdict"] == "PATCHED" and i["version_status"] in ("vulnerable", "eol") and i["fingerprint"]:
-            status_line = "status=backported (version string predates the fix; patch markers confirm the build)"
-        else:
-            status_line = "status=%s: %s" % (i["version_status"], i["version_reason"])
-        print("      kind=%s  version=%s (%s)  %s" % (i["kind"], i["version"], i["version_source"], status_line))
-        print("      patch-markers=%s  %s  found-via=%s" % (fp, running, ",".join(i["sources"])))
-        conf = i.get("config")
-        if conf:
-            keys = [("session.upload_progress.enabled", "upload_progress"), ("fatal_error_backtraces", "fatal_error_backtraces"),
-                    ("memory_limit", "memory_limit"), ("memory_hard_limit_percent", "hard_limit%"), ("post_max_size", "post_max_size"),
-                    ("upload_max_filesize", "upload_max_filesize"), ("max_input_nesting_level", "nesting")]
-            print("      ini: " + "  ".join("%s=%s" % (label, conf[k]) for k, label in keys if k in conf and conf[k] != "no value"))
-            cf = i.get("config_files") or {}
-            if cf.get("ini_file") or cf.get("scan_dir"):
-                print("      ini-files: %s  scan-dir: %s" % (cf.get("ini_file"), cf.get("scan_dir")))
-        elif i.get("config_note"):
-            print("      ini: %s" % i["config_note"])
-        for sc in i.get("sapi_configs", []):
-            print("      [%s sapi] upload_progress=%s memory_limit=%s post_max_size=%s (%s)" % (
-                sc["sapi"], sc["config"].get("session.upload_progress.enabled", "?"), sc["config"].get("memory_limit", "?"),
-                sc["config"].get("post_max_size", "?"), sc["ini_file"]))
-        fp_ = i.get("fpm_pools")
-        if fp_ and fp_["pools"]:
-            for pool, vals in fp_["pools"].items():
-                if pool.lower() in ("general", "global"):
-                    continue
-                ov = ["%s[%s]=%s" % (v[0], k, v[1]) for k, v in vals.items() if v[0] != "setting"]
-                pm = vals.get("pm.max_requests", ("", "?"))[1]
-                print("      fpm pool [%s]: pm.max_requests=%s %s" % (pool, pm, " ".join(ov) if ov else "(no php_* overrides)"))
+        print_install(i)
     if r["packages"]:
         print()
         banner("Packages (%d)" % len(r["packages"]))
-        for p in r["packages"]:
-            col = {"patched": "green", "vulnerable": "red"}.get(p["status"], "yellow")
-            print("  %s %-6s %-28s %-40s %s" % (c("%-10s" % p["status"].upper(), col), p["manager"], p["package"], p["version"], p["detail"]))
-    if r["docker"]:
+        print_packages(r["packages"])
+    if r["docker"] or r.get("docker_error"):
         print()
-        banner("Docker containers (%d)%s" % (len(r["docker"]), " - inspected automatically, no PHP on the host" if r.get("docker_auto") else ""))
+        banner("Docker containers with PHP (%d)%s" % (len(r["docker"]),
+                                                       " - inspected automatically, no PHP on the host; --docker for ini/pools/packages" if r.get("docker_auto") else ""))
+        if r.get("docker_error"):
+            print(c("  %s" % r["docker_error"], "yellow"))
         for d in r["docker"]:
             col = {"PATCHED": "green", "VULNERABLE": "red"}.get(d["verdict"], "yellow")
-            print("  %s %-24s %-40s php=%s markers=%s %s" % (c("%-10s" % d["verdict"], col), d["name"][:24], d["image"][:40], d["version"], d["fingerprint"], d["note"]))
+            comp = d.get("compose")
+            where = "  compose %s/%s" % (comp["project"], comp["service"]) if comp else ""
+            if d.get("proc_pids"):
+                where += c("  (also seen from the host: /proc pid %s)" % ",".join(map(str, sorted(set(d["proc_pids"]))[:4])), "cyan")
+            print("  %s %s  image=%s%s" % (c("%-10s" % d["verdict"], col), c(d["name"], "bold"), d["image"], where))
+            for i in d["installs"]:
+                print_install(i, pad="      ")
+            if d["packages"]:
+                print_packages(d["packages"], pad="      ")
     print()
     banner("Findings (%d)" % len(r["findings"]))
     if not r["findings"]:
@@ -1396,82 +1621,517 @@ def print_scan_report(r):
               "  machine behind the web server here, run scan there (or with --docker). See the hints above.")
     if r["verdict"] == "VULNERABLE":
         print("  Update PHP to 8.5.12 / 8.4.27 / 8.3.36 / 8.2.35 (or your vendor backport) and restart every worker.")
-        print("  Until then: `%s protect --apply` applies the php.net interim mitigations. See %s" % (sys.argv[0], ADVISORY_URL))
-
-
-def no_php_hints(report):
-    """Explain a NO_PHP result: what else is on the box that could still
-    front a PHP runtime somewhere else."""
-    hints = []
-    procs = running_processes()
-    web = sorted(set(p["comm"] for p in procs if p["comm"] in ("nginx", "apache2", "httpd", "caddy", "litespeed", "lshttpd")))
-    if web:
-        hints.append("web server running without a local PHP runtime (%s): it may proxy to containers, Kubernetes pods or another host; "
-                     "scan those" % ", ".join(web))
-    if which("docker"):
-        rc, out, _ = run(["docker", "ps", "-q"], timeout=20)
-        n = len(out.split()) if rc == 0 else 0
-        if rc != 0:
-            hints.append("docker is installed but `docker ps` failed (daemon down or no permission); PHP containers would not be visible")
-        elif n and not report.get("docker"):
-            hints.append("%d running container(s) inspected, none has a PHP binary" % n)
-        elif report.get("docker_auto"):
-            hints.append("no PHP on the host, so running containers were inspected automatically (same as --docker)")
-    for tool in ("podman", "kubectl", "ctr", "crictl"):
-        if which(tool):
-            hints.append("%s is installed: workloads under it are not inspected by this tool; run scan inside those containers/pods" % tool)
-    if which("snap"):
-        rc, out, _ = run(["snap", "list"], timeout=20)
-        if rc == 0 and re.search(r"(?m)^(nextcloud|wordpress|php)", out):
-            hints.append("a snap bundles its own PHP (see `snap list`); check its upstream for the fixed revision")
-    if os.name != "nt" and os.path.isdir("/proc") and not is_root():
-        hints.append("not root: binaries behind other users' processes may be invisible")
-    return hints
-
-
-def scan_docker():
-    if not which("docker"):
-        return []
-    rc, out, err = run(["docker", "ps", "--format", "{{.ID}}\t{{.Names}}\t{{.Image}}"], timeout=30)
-    if rc != 0:
-        return [{"name": "-", "image": "-", "version": None, "fingerprint": None, "verdict": "UNKNOWN", "note": "docker ps failed: %s" % err.strip()[:120]}]
-    results = []
-    for line in out.splitlines():
-        parts = line.split("\t")
-        if len(parts) != 3:
-            continue
-        cid, name, image = parts
-        rc, bins, _ = run(["docker", "exec", cid, "sh", "-c",
-                           "for b in php php-fpm php-cgi frankenphp; do command -v $b 2>/dev/null; done; ls /usr/local/sbin/php-fpm /usr/sbin/php-fpm* 2>/dev/null"], timeout=20)
-        bins = sorted(set(b.strip() for b in bins.splitlines() if b.strip()))
-        if not bins:
-            continue
-        version, markers, note = None, 0, ""
-        for b in bins:
-            rc, v, e = run(["docker", "exec", cid, b, "-n", "-v"], timeout=20)
-            m = re.search(r"PHP (\d+\.\d+\.\d+\S*)", v + e)
-            if m:
-                version = m.group(1)
-            rc, g, _ = run(["docker", "exec", cid, "sh", "-c",
-                            "grep -c -a -e memory_hard_limit_percent -e zend_mm_safe_error_ex %s 2>/dev/null || (tr -c '[:print:]' '\\n' < %s | grep -c -e memory_hard_limit_percent -e zend_mm_safe_error_ex)" % (b, b)], timeout=30)
-            try:
-                markers = max(markers, int(g.strip().splitlines()[-1]))
-            except (ValueError, IndexError):
-                pass
-            if version:
-                break
-        st, why = classify_version(version or "")
-        if markers > 0 or st == "patched":
-            verdict = "PATCHED"
-        elif st in ("vulnerable", "eol"):
-            verdict = "VULNERABLE"
-            note = why
+        if any(d["verdict"] == "VULNERABLE" for d in r["docker"]):
+            print("  Containers: rebuild from a fixed image. Until then `%s protect --docker --apply --restart`" % sys.argv[0])
+            print("  applies the interim mitigations inside them. See %s" % ADVISORY_URL)
         else:
-            verdict = "UNKNOWN"
-            note = why
-        results.append({"id": cid, "name": name, "image": image, "version": version, "fingerprint": markers > 0,
-                        "verdict": verdict, "note": note, "binaries": bins})
-    return results
+            print("  Until then: `%s protect --apply` applies the php.net interim mitigations. See %s" % (sys.argv[0], ADVISORY_URL))
+
+
+# --------------------------------------------------------------------------
+# Docker containers
+# --------------------------------------------------------------------------
+# Official php:* images ship no Python and no ps, so containers are driven
+# from the host: docker exec runs the same probes the host scan runs,
+# docker cp streams file trees for hunt, and the bind mounts reported by
+# docker inspect let files that really live on the host be read in place.
+# Paths that come from inside a container are only ever passed to sh as
+# arguments, never spliced into a script.
+
+# One line per process: P<US>stat<US>exe<US>cmdline, plus M<US>pid<US>module
+# for PHP modules mapped into Apache / LiteSpeed processes.
+CONTAINER_PROC_SH = r"""
+for p in /proc/[0-9]*; do
+  s=$(cat "$p/stat" 2>/dev/null) || continue
+  printf 'P\037%s\037%s\037%s\n' "$s" "$(readlink "$p/exe" 2>/dev/null)" "$(tr '\000' ' ' < "$p/cmdline" 2>/dev/null)"
+  case "$s" in
+    *"(apache2)"*|*"(httpd)"*|*"(litespeed)"*|*"(lshttpd)"*)
+      grep -E -o '/[^ ]*(libphp|mod_php)[^ ]*\.so( \(deleted\))?' "$p/maps" 2>/dev/null | sort -u |
+        while read -r m; do printf 'M\037%s\037%s\n' "${p#/proc/}" "$m"; done;;
+  esac
+done
+"""
+# $1 = test flag (f, d, e), then glob patterns; prints the matches that pass.
+CONTAINER_LIST_SH = 'k=$1; shift; for pat in "$@"; do for p in $pat; do [ -$k "$p" ] && echo "$p"; done; done'
+# Every file on PATH (filtered with BIN_NAME_RE on the host).
+CONTAINER_PATH_SH = 'IFS=:; for d in $PATH; do for f in "$d"/*; do [ -f "$f" ] && echo "$f"; done; done'
+CONTAINER_REALPATH_SH = 'for f in "$@"; do r=$(readlink -f "$f" 2>/dev/null) || r=$f; [ -f "$r" ] && printf "%s\\t%s\\n" "$f" "$r"; done'
+# grep -a is missing from some busybox builds (exit 2); fall back to tr. The
+# octal range is deliberate: busybox tr -c does not understand [:print:].
+CONTAINER_MARKERS_SH = r"""f=$1; shift
+for m in "$@"; do
+  grep -a -q -F "$m" "$f" 2>/dev/null; r=$?
+  if [ "$r" -eq 0 ]; then echo "$m"
+  elif [ "$r" -ge 2 ] && tr -c '\040-\176' '\n' < "$f" 2>/dev/null | grep -q -F "$m"; then echo "$m"; fi
+done"""
+CONTAINER_BYTES_VERSION_SH = r"""for re in 'X-Powered-By: PHP/[0-9]+\.[0-9]+\.[0-9]+[A-Za-z0-9~-]*' 'PHP/[0-9]+\.[0-9]+\.[0-9]+'; do
+  v=$(grep -a -o -E "$re" "$1" 2>/dev/null | head -n 1)
+  [ -n "$v" ] || v=$(tr -c '\040-\176' '\n' < "$1" 2>/dev/null | grep -o -E "$re" | head -n 1)
+  [ -n "$v" ] && break
+done
+echo "$v"
+"""
+CONTAINER_STAT_SH = r"""for pat in "$@"; do for p in $pat; do [ -f "$p" ] && printf '%s\t%s\t%s\n' "$p" "$(stat -c %Y "$p" 2>/dev/null)" "$(stat -c %s "$p" 2>/dev/null)"; done; done"""
+CONTAINER_APACHE_GREP_SH = r"""for d in "$@"; do [ -d "$d" ] && grep -r -n -i -E '^[[:space:]]*(php_(admin_)?(value|flag)|RLimitMEM|LimitRequestBody)[[:space:]]' "$d" 2>/dev/null; done"""
+
+DOCKER_WEB_RE = re.compile(r"nginx|httpd|apache|caddy|openresty|litespeed|lsws|frankenphp", re.I)
+DOCKER_WEBROOT_CANDIDATES = ("/var/www", "/app", "/srv", "/usr/share/nginx/html", "/usr/local/apache2/htdocs")
+# Mount destinations that hold configuration, logs or data, not code.
+DOCKER_NON_CODE_MOUNTS = ("/etc", "/usr/local/etc", "/var/log", "/var/lib/mysql", "/var/lib/postgresql", "/var/lib/redis",
+                          "/data", "/proc", "/sys", "/dev", "/run", "/var/run", "/tmp")
+
+
+def parse_proc_snapshot(text):
+    """Process list in running_processes() format from CONTAINER_PROC_SH output."""
+    procs, by_pid = [], {}
+    for line in text.splitlines():
+        parts = line.split("\x1f")
+        if parts[0] == "P" and len(parts) >= 4:
+            st = parts[1]
+            try:
+                pid = int(st.split(" ", 1)[0])
+                comm = st[st.index("(") + 1:st.rindex(")")]
+                ppid = int(st.rsplit(")", 1)[1].split()[1])
+            except (ValueError, IndexError):
+                continue
+            exe, deleted = parts[2].strip() or None, False
+            if exe and exe.endswith(" (deleted)"):
+                exe, deleted = exe[:-10], True
+            proc = {"pid": pid, "ppid": ppid, "comm": comm, "exe": exe, "deleted": deleted,
+                    "cmdline": parts[3].strip(), "php_modules": [], "module_deleted": False, "user": None}
+            procs.append(proc)
+            by_pid[pid] = proc
+        elif parts[0] == "M" and len(parts) >= 3:
+            try:
+                proc = by_pid[int(parts[1])]
+            except (ValueError, KeyError):
+                continue
+            mp = parts[2].strip()
+            if mp.endswith(" (deleted)"):
+                proc["module_deleted"] = True
+                mp = mp[:-10]
+            if mp not in proc["php_modules"]:
+                proc["php_modules"].append(mp)
+    return procs
+
+
+class Container(object):
+    """A running container, with HostContext's interface implemented through
+    docker exec (as root inside the container, like a root scan on a host)."""
+
+    join = staticmethod(posixpath.join)
+
+    def __init__(self, info):
+        self.full_id = info.get("Id") or ""
+        self.id = self.full_id[:12]
+        self.name = (info.get("Name") or self.id).lstrip("/")
+        cfg = info.get("Config") or {}
+        self.image = cfg.get("Image") or info.get("Image") or "?"
+        labels = cfg.get("Labels") or {}
+        self.compose = None
+        # compose build copies project/service labels into the image, so only
+        # config-hash proves compose created this container
+        if labels.get("com.docker.compose.project") and labels.get("com.docker.compose.config-hash"):
+            self.compose = {"project": labels["com.docker.compose.project"],
+                            "service": labels.get("com.docker.compose.service") or "",
+                            "working_dir": labels.get("com.docker.compose.project.working_dir") or "",
+                            "config_files": labels.get("com.docker.compose.project.config_files") or ""}
+        self.mounts = [{"type": m.get("Type"), "source": m.get("Source") or "", "destination": m["Destination"],
+                        "rw": m.get("RW", True)} for m in info.get("Mounts") or [] if m.get("Destination")]
+        self._procs = None
+        self._bins = None
+
+    def run(self, cmd, timeout=20, stdin_data=None, binary=False):
+        argv = ["docker", "exec", "-u", "0"] + (["-i"] if stdin_data is not None else []) + [self.full_id] + list(cmd)
+        return run(argv, timeout=timeout, stdin_data=stdin_data, binary=binary)
+
+    def sh(self, script, *args, **kw):
+        return self.run(["sh", "-c", script, "sh"] + list(args), **kw)
+
+    def which(self, name):
+        rc, out, _ = self.sh('command -v "$1"', name)
+        out = out.strip()
+        return out if rc == 0 and out.startswith("/") else None
+
+    def isfile(self, path):
+        return self.sh('[ -f "$1" ]', path)[0] == 0
+
+    def isdir(self, path):
+        return self.sh('[ -d "$1" ]', path)[0] == 0
+
+    def exists(self, path):
+        return self.sh('[ -e "$1" ]', path)[0] == 0
+
+    def glob(self, pattern):
+        return self.existing([pattern], "e")
+
+    def existing(self, patterns, kind="f"):
+        rc, out, _ = self.sh(CONTAINER_LIST_SH, kind, *patterns, timeout=30)
+        return sorted(set(l for l in out.splitlines() if l.startswith("/")))
+
+    def stat_files(self, patterns):
+        """[(path, mtime, size)] for regular files matching the globs."""
+        rc, out, _ = self.sh(CONTAINER_STAT_SH, *patterns, timeout=30)
+        res = []
+        for line in out.splitlines():
+            parts = line.split("\t")
+            if len(parts) == 3 and parts[1].isdigit() and parts[2].isdigit():
+                res.append((parts[0], int(parts[1]), int(parts[2])))
+        return res
+
+    def read_text(self, path):
+        rc, out, _ = self.run(["cat", path], timeout=30)
+        return out if rc == 0 else None
+
+    def read_bytes(self, path, limit):
+        rc, out, _ = self.run(["head", "-c", str(limit), path], timeout=30, binary=True)
+        return out if rc == 0 else None
+
+    def write_text(self, path, text, mode=None):
+        script = 'cat > "$1"' + (' && chmod %o "$1"' % mode if mode is not None else "")
+        rc, out, err = self.sh(script, path, stdin_data=text.encode("utf-8"))
+        if rc != 0:
+            raise OSError((err or out).strip() or "write failed")
+
+    def backup(self, path, bak):
+        rc, out, err = self.sh('[ -e "$2" ] || cp -p "$1" "$2"', path, bak)
+        if rc != 0:
+            raise OSError((err or out).strip() or "backup failed")
+
+    def remove(self, path):
+        rc, out, err = self.run(["rm", "-f", path])
+        if rc != 0:
+            raise OSError((err or out).strip() or "remove failed")
+
+    def markers(self, path):
+        rc, out, _ = self.sh(CONTAINER_MARKERS_SH, path, *[m.decode() for m in PATCH_MARKERS], timeout=90)
+        return set(l.strip() for l in out.splitlines() if l.strip())
+
+    def bytes_version(self, path):
+        rc, out, _ = self.sh(CONTAINER_BYTES_VERSION_SH, path, timeout=90)
+        m = re.search(r"PHP/(\d+\.\d+\.\d+(?:[-~]?(?:RC|rc|alpha|beta|dev)\d*)?)", out)
+        return m.group(1) if m else None
+
+    def host_path(self, path):
+        """The host file behind a bind mount, or None when path lives in the
+        container (or the daemon's filesystem is not this machine's)."""
+        best = None
+        for m in self.mounts:
+            d = m["destination"].rstrip("/")
+            if m["type"] != "bind" or not m["source"] or not d:
+                continue
+            if path == d or path.startswith(d + "/"):
+                if best is None or len(d) > len(best[0]):
+                    best = (d, m["source"])
+        if not best or not os.path.exists(best[1]):
+            return None
+        hp = best[1] if path == best[0] else os.path.join(best[1], *path[len(best[0]) + 1:].split("/"))
+        src, real = os.path.realpath(best[1]), os.path.realpath(hp)
+        if real != src and not real.startswith(src.rstrip(os.sep) + os.sep):
+            return None  # a symlink inside the mount points elsewhere on the host
+        return hp
+
+    def where(self, path):
+        hp = self.host_path(path)
+        return "%s:%s%s" % (self.name, path, " (bind mount of %s)" % hp if hp else "")
+
+    def processes(self, refresh=False):
+        if self._procs is None or refresh:
+            rc, out, _ = self.sh(CONTAINER_PROC_SH, timeout=30)
+            self._procs = parse_proc_snapshot(out)
+        return self._procs
+
+    def php_binaries(self):
+        """PHP executables and Apache PHP modules inside the container, as
+        find_php_binaries() entries (real paths)."""
+        if self._bins is not None:
+            return self._bins
+        cands = []
+        rc, out, _ = self.sh(CONTAINER_PATH_SH, timeout=30)
+        cands += [(l, "PATH") for l in out.splitlines() if BIN_NAME_RE.match(posixpath.basename(l))]
+        for p in self.existing(BIN_GLOBS + MODULE_GLOBS, "f"):
+            if p.endswith(".so"):
+                cands.append((p, "module-glob"))
+            elif BIN_NAME_RE.match(posixpath.basename(p)):
+                cands.append((p, "path-glob"))
+        for proc in self.processes():
+            exe = proc["exe"]
+            if exe and (BIN_NAME_RE.match(posixpath.basename(exe)) or re.search(r"(libphp|mod_php)", exe)):
+                cands.append((exe, "process"))
+            for mod in proc["php_modules"]:
+                cands.append((mod, "process-maps"))
+        found = {}
+        if cands:
+            rc, out, _ = self.sh(CONTAINER_REALPATH_SH, *sorted(set(p for p, _ in cands)), timeout=30)
+            real = dict(line.split("\t", 1) for line in out.splitlines() if "\t" in line)
+            for p, src in cands:
+                if p in real:
+                    found.setdefault(real[p], {"path": real[p], "sources": set()})["sources"].add(src)
+        self._bins = sorted(found.values(), key=lambda e: e["path"])
+        return self._bins
+
+
+def docker_containers(names=None):
+    """Running containers, optionally only those named (or id-prefixed).
+    Returns (containers, error or None)."""
+    if not which("docker"):
+        return [], "docker CLI not found"
+    rc, out, err = run(["docker", "ps", "-q", "--no-trunc"], timeout=30)
+    if rc != 0:
+        return [], "docker ps failed: %s" % ((err or out).strip().splitlines() or ["?"])[-1][:200]
+    cts = []
+    ids = out.split()
+    if ids:
+        rc, out, err = run(["docker", "inspect"] + ids, timeout=60)
+        try:
+            cts = [Container(d) for d in json.loads(out or "[]") if (d.get("State") or {}).get("Running")]
+        except ValueError:
+            return [], "docker inspect failed: %s" % ((err or out).strip().splitlines() or ["?"])[-1][:200]
+    if not names:
+        return cts, None
+    sel, missing = [], []
+    for n in names:
+        hit = [ct for ct in cts if ct.name == n or ct.full_id.startswith(n)]
+        if not hit:
+            missing.append(n)
+        sel.extend(h for h in hit if h not in sel)
+    return sel, ("not running: %s" % ", ".join(missing)) if missing else None
+
+
+def docker_php_targets(names=None):
+    """[(container, php binaries)] for running containers that have PHP,
+    plus the names of those without, and an error string."""
+    cts, err = docker_containers(names)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(8, len(cts)))) as ex:
+        bins = list(ex.map(lambda ct: ct.php_binaries(), cts))
+    targets = [(ct, b) for ct, b in zip(cts, bins) if b]
+    without = [ct.name for ct, b in zip(cts, bins) if not b]
+    return targets, without, err
+
+
+def scan_apache_configs_in(ct):
+    rc, out, _ = ct.sh(CONTAINER_APACHE_GREP_SH, *(APACHE_CONF_DIRS + ["/usr/local/apache2/conf"]), timeout=30)
+    findings, seen = [], set()
+    for line in out.splitlines():
+        parts = line.split(":", 2)
+        if len(parts) != 3 or not parts[1].isdigit():
+            continue
+        f, n, text = parts
+        if not (f.endswith(".conf") or posixpath.basename(f) == ".htaccess"):
+            continue
+        d = apache_directive(text)
+        if not d:
+            continue
+        key = (f, d[0], d[1], d[2].lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        findings.append({"file": f, "line": int(n), "kind": d[0], "key": d[1], "value": d[2]})
+    return findings
+
+
+def scan_container(ct, bins, no_config=False):
+    procs = ct.processes()
+    pkgs = check_packages(ct)
+    installs = [assess_install(b, procs, pkgs, no_config=no_config, ctx=ct) for b in bins]
+    if any(i["verdict"] == "VULNERABLE" for i in installs) or any(p["status"] == "vulnerable" for p in pkgs):
+        verdict = "VULNERABLE"
+    elif any(i["verdict"] == "UNKNOWN" for i in installs):
+        verdict = "UNKNOWN"
+    else:
+        verdict = "PATCHED"
+    first = next((i for i in installs if i["version"]), installs[0])
+    bad = next((i for i in installs if i["verdict"] == "VULNERABLE"), None)
+    return {"id": ct.id, "name": ct.name, "image": ct.image, "compose": ct.compose, "mounts": ct.mounts,
+            "installs": installs, "packages": pkgs, "apache": scan_apache_configs_in(ct), "verdict": verdict,
+            "version": first["version"], "fingerprint": any(i["fingerprint"] for i in installs),
+            "note": bad["version_reason"] if bad else "", "binaries": [i["path"] for i in installs]}
+
+
+def scan_docker(names=None, no_config=False):
+    """Assess every running container that has PHP. Returns (results, error)."""
+    targets, without, err = docker_php_targets(names)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(8, len(targets)))) as ex:
+        results = list(ex.map(lambda t: scan_container(t[0], t[1], no_config), targets))
+    if names and without:
+        msg = "no PHP found in: %s" % ", ".join(without)
+        err = "%s; %s" % (err, msg) if err else msg
+    return results, err
+
+
+def container_fix(d, inst):
+    """How to replace an unpatched runtime in this container."""
+    v = parse_version(inst.get("version") or "")
+    flavour = {"fpm": "-fpm", "module": "-apache"}.get(inst["kind"], "-cli")
+    if v and v[:2] in FIXED:
+        target = "PHP %s+ (e.g. a freshly pulled php:%d.%d%s)" % (".".join(map(str, FIXED[v[:2]])), v[0], v[1], flavour)
+    elif v and v[:2] < (8, 2):
+        target = "PHP 8.2+ (e.g. php:8.3%s; %d.%d has no upstream fix) or a vendor-backported build" % (flavour, v[0], v[1])
+    else:
+        target = "a fixed PHP build"
+    comp = d.get("compose")
+    if comp and comp.get("service"):
+        files = "".join(" -f %s" % f for f in comp["config_files"].split(",") if f)
+        how = "docker compose%s build --pull %s && docker compose%s up -d %s" % (files, comp["service"], files, comp["service"])
+        if re.match(re.escape(comp["project"]) + r"[-_]", d["image"]):
+            how = "update FROM in the service's Dockerfile, then " + how
+    else:
+        how = "pull or rebuild %s and recreate the container" % d["image"]
+    return "rebuild on %s: %s" % (target, how)
+
+
+def container_findings(d):
+    out = []
+    for inst in d["installs"]:
+        out.extend(install_findings(inst, d["name"], container_fix(d, inst)))
+    out.extend(package_findings(d["packages"], d["name"]))
+    out.extend(apache_findings(d["apache"], d["name"]))
+    return out
+
+
+def _container_workers(ct):
+    procs = ct.processes(refresh=True)
+    masters = [p for p in procs if re.match(r"php-?fpm", p["comm"]) and "master process" in p["cmdline"]]
+    apache_pids = set(p["pid"] for p in procs if p["comm"] in ("apache2", "httpd"))
+    apache_roots = [p for p in procs if p["pid"] in apache_pids and p["ppid"] not in apache_pids]
+    roots = set(p["pid"] for p in masters + apache_roots)
+    workers = set(p["pid"] for p in procs if p["ppid"] in roots)
+    return masters, apache_roots, workers
+
+
+def reload_container(ct, dry):
+    """Have PHP-FPM / Apache inside the container re-read their configuration
+    (graceful); restart the container when neither is found."""
+    masters, apache_roots, before = _container_workers(ct)
+    # kill through sh: slim images have no procps, only the shell builtin
+    cmds = []
+    if masters:
+        cmds.append(["-USR2"] + [str(p["pid"]) for p in masters])
+    if apache_roots:
+        cmds.append(["-USR1"] + [str(p["pid"]) for p in apache_roots])
+    if not cmds:
+        if dry:
+            print(c("  would run: docker restart %s (no PHP-FPM master or Apache found to reload: this is a full "
+                    "container restart, not a graceful reload)" % ct.name, "yellow"))
+            return
+        print(c("  no PHP-FPM master or Apache found in %s: restarting the whole container" % ct.name, "yellow"))
+        rc, out, err = run(["docker", "restart", ct.full_id], timeout=180)
+        print("  %s docker restart %s" % (c("ok  ", "green") if rc == 0 else c("FAIL", "red"), ct.name))
+        return
+    for cmd in cmds:
+        shown = "kill " + " ".join(cmd)
+        if dry:
+            print("  would run: docker exec %s %s" % (ct.name, shown))
+            continue
+        rc, out, err = ct.sh('kill "$@"', *cmd, timeout=30)
+        print("  %s docker exec %s %s%s" % (c("ok  ", "green") if rc == 0 else c("FAIL", "red"), ct.name, shown,
+                                           "" if rc == 0 else " (%s)" % (err or out).strip()[:120]))
+    if dry:
+        return
+    time.sleep(2)
+    _, _, after = _container_workers(ct)
+    if before and not (before - after):
+        print(c("  WARNING: no worker process was replaced (pids %s); restart the container by hand." %
+                ",".join(map(str, sorted(before)[:8])), "yellow"))
+    else:
+        print("  workers replaced (%d before, %d after, %d survived)" % (len(before), len(after), len(before & after)))
+
+
+def container_persistence_note(ct, paths):
+    """Explain where container changes live and how to keep them."""
+    layer = [p for p in paths if not ct.host_path(p)]
+    for p in paths:
+        hp = ct.host_path(p)
+        if hp:
+            print("  %s is a bind mount: the host file %s was changed and the change persists" % (p, hp))
+    if not layer:
+        return
+    print(c("  %s in the container's writable layer: they survive `docker restart` but are" %
+            ("The other changes are" if len(layer) < len(paths) else "These changes are"), "yellow"))
+    print(c("  lost when the container is recreated (compose up --build / --force-recreate, image updates).", "yellow"))
+    dropin = next((p for p in layer if p.endswith("/" + DROPIN_NAME)), None)
+    if not dropin:
+        return
+    comp = ct.compose or {}
+    dest = comp.get("working_dir") or "."
+    print("  To keep the drop-in, copy it out and mount it read-only (or COPY it in the Dockerfile):")
+    print("    docker cp %s:%s %s/%s" % (ct.name, dropin, dest, DROPIN_NAME))
+    if comp.get("service"):
+        print("    # docker-compose.yml, service %s:" % comp["service"])
+    print("    volumes:")
+    print("      - ./%s:%s:ro" % (DROPIN_NAME, dropin))
+
+
+def stream_lines(cmd, merge_stderr=False, gz=False, max_lines=2000000):
+    """Yield the decoded output lines of a command without buffering it all."""
+    try:
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT if merge_stderr else subprocess.DEVNULL)
+    except OSError:
+        return
+    try:
+        src = gzip.GzipFile(fileobj=p.stdout) if gz else p.stdout
+        for raw in itertools.islice(src, max_lines):
+            yield raw.decode("utf-8", "replace")
+    except (OSError, EOFError):
+        pass
+    finally:
+        if p.poll() is None:
+            p.kill()
+        p.stdout.close()
+        p.wait()
+
+
+def docker_tar_members(ct, path, want, max_bytes=2 * 1024 ** 3):
+    """Stream `docker cp ct:path -` and yield (container path, mtime, size, fileobj)
+    for regular files accepted by want(container path, size). Needs nothing
+    inside the container. The fileobj must be read before the next item."""
+    base = posixpath.dirname(path.rstrip("/")) or "/"
+    try:
+        p = subprocess.Popen(["docker", "cp", "%s:%s" % (ct.full_id, path), "-"],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except OSError:
+        return
+    total = 0
+    try:
+        with tarfile.open(fileobj=p.stdout, mode="r|") as tf:
+            for m in tf:
+                total += m.size
+                if total > max_bytes:
+                    break
+                if not m.isreg():
+                    continue
+                cpath = posixpath.join(base, m.name)
+                if want(cpath, m.size):
+                    yield cpath, m.mtime, m.size, tf.extractfile(m)
+    except (tarfile.TarError, OSError, EOFError):
+        pass
+    finally:
+        if p.poll() is None:
+            p.kill()
+        p.stdout.close()
+        p.wait()
+
+
+LAYER_PERSISTENCE_RE = re.compile(r"^/(?:etc/cron|var/spool/cron|etc/systemd/system/|etc/rc\.local$|etc/ld\.so\.preload$|"
+                                  r"root/\.ssh/|home/[^/]+/\.ssh/|var/www/\.ssh/|etc/passwd$|etc/shadow$|etc/sudoers|etc/profile\.d/)")
+
+
+def classify_layer_changes(lines):
+    """PHP files and persistence-related paths added or changed in a
+    container's writable layer (`docker diff` output)."""
+    php, persist = [], []
+    for line in lines:
+        m = re.match(r"^([AC])\s+(/.*)$", line.strip())
+        if not m:
+            continue
+        path = m.group(2)
+        low = posixpath.basename(path).lower()
+        if low.endswith(WEB_EXTS) or ".php." in low:
+            php.append(path)
+        elif LAYER_PERSISTENCE_RE.match(path):
+            persist.append(path)
+    return php, persist
 
 
 # --------------------------------------------------------------------------
@@ -1541,15 +2201,16 @@ def apache_conf_text(args, has_85):
     return "\n".join(body) + "\n"
 
 
-def discover_confd_dirs():
-    dirs = set(d for d in expand_globs(CONFD_GLOBS) if os.path.isdir(d))
+def discover_confd_dirs(ctx=None, bins=None):
+    ctx = ctx or HOST
+    dirs = set(ctx.existing(CONFD_GLOBS, "d"))
     # ask each binary where it scans
-    for b in find_php_binaries():
+    for b in (find_php_binaries() if bins is None else bins):
         kind = binary_kind(b["path"])
         if kind == "module" or b.get("unreadable"):
             continue
-        conf, info, note = effective_ini_from_binary(b["path"], kind)
-        if info and info.get("scan_dir") and os.path.isdir(info["scan_dir"]):
+        conf, info, note = effective_ini_from_binary(b["path"], kind, ctx)
+        if info and info.get("scan_dir") and ctx.isdir(info["scan_dir"]):
             dirs.add(info["scan_dir"])
         elif info and info.get("ini_file"):
             # no scan dir: fall back to appending to php.ini is too invasive; report it
@@ -1557,16 +2218,13 @@ def discover_confd_dirs():
     return sorted(dirs)
 
 
-def discover_fpm_pools():
-    return sorted(set(p for p in expand_globs(FPM_POOL_GLOBS) if os.path.isfile(p)))
+def discover_fpm_pools(ctx=None):
+    return (ctx or HOST).existing(FPM_POOL_GLOBS, "f")
 
 
-def discover_apache_dir():
-    for d in ("/etc/apache2/conf-available", "/etc/httpd/conf.d", "/usr/local/apache/conf/includes",
-              "/usr/local/etc/apache24/Includes", "/etc/apache24/Includes", "/opt/homebrew/etc/httpd/extra"):
-        if os.path.isdir(d):
-            return d
-    return None
+def discover_apache_dir(ctx=None):
+    found = set((ctx or HOST).existing(list(APACHE_INCLUDE_DIRS), "d"))
+    return next((d for d in APACHE_INCLUDE_DIRS if d in found), None)
 
 
 def php_services():
@@ -1663,8 +2321,93 @@ def restart_services(dry):
             print("  (masters started outside the service manager are not restarted by it; stop them by hand)")
 
 
+def protect_target(args, ctx, bins, apply_):
+    """Show (dry run) or write the mitigations for one target.
+    Returns (paths planned, paths changed)."""
+    confd = discover_confd_dirs(ctx, bins)
+    pools = discover_fpm_pools(ctx)
+    adir = discover_apache_dir(ctx)
+    has_85 = any((parse_version(php_version_of(b["path"], binary_kind(b["path"]), ctx)[0] or "") or (0, 0))[:2] == (8, 5)
+                 for b in bins if not b.get("unreadable"))
+    has_module = any(binary_kind(b["path"]) == "module" for b in bins)
+    planned, changes = [], []
+
+    def write(path, text, mode=None, backup=False):
+        planned.append(path)
+        if not apply_:
+            return True
+        try:
+            if backup:
+                ctx.backup(path, path + ".php2shell-guard.bak")
+            ctx.write_text(path, text, mode)
+        except (OSError, IOError) as e:
+            print("    %s %s" % (c("FAIL", "red"), e))
+            return False
+        changes.append(path)
+        return True
+
+    text = dropin_text(args)
+    print("php.ini drop-in (%s):" % DROPIN_NAME)
+    print("".join("    " + l + "\n" for l in text.splitlines()))
+    for d in confd:
+        if d.startswith("!"):
+            print("  %s %s has no scan dir; add the directives to it by hand" % (sev("MEDIUM"), ctx.where(d[1:])))
+            continue
+        target = ctx.join(d, DROPIN_NAME)
+        print("  %s %s" % ("update " if ctx.exists(target) else "write  ", ctx.where(target)))
+        write(target, text, mode=0o644)
+    if not confd:
+        print("  no conf.d directories found")
+
+    print("\nFPM pools (php_admin_* lines inserted under each [pool] header):")
+    for p in pools:
+        content = ctx.read_text(p)
+        if content is None:
+            print("  skip %s (unreadable)" % ctx.where(p))
+            continue
+        # one PHP per container; on a host only versioned pool paths can be told apart
+        is85 = has_85 and ("8.5" in p or ctx is not HOST)
+        block = fpm_block_lines(args, is85)
+        new = insert_fpm_block(content, block)
+        if new == content:
+            print("  unchanged %s" % ctx.where(p))
+            continue
+        print("  %s %s" % ("patch  " if not args.no_fpm_pools else "skip   ", ctx.where(p)))
+        if not args.no_fpm_pools:
+            write(p, new, backup=True)
+    if not pools:
+        print("  no pool files found")
+
+    print("\nApache (mod_php) config:")
+    if not adir or args.no_apache:
+        print("  no Apache config dir found (or --no-apache)")
+    elif ctx is not HOST and not has_module:
+        print("  skipped: no mod_php in this container")
+    else:
+        target = ctx.join(adir, APACHE_CONF_NAME)
+        print("  write   %s" % ctx.where(target))
+        print("".join("    " + l + "\n" for l in apache_conf_text(args, has_85).splitlines()))
+        if write(target, apache_conf_text(args, has_85)) and apply_:
+            if adir == "/etc/apache2/conf-available" and ctx.which("a2enconf"):
+                ctx.run(["a2enconf", APACHE_CONF_NAME[:-5]], timeout=30)
+            for tester in (("apachectl", "-t"), ("apache2ctl", "-t"), ("httpd", "-t")):
+                if ctx.which(tester[0]):
+                    rc, out, err = ctx.run(list(tester), timeout=30)
+                    ok = rc == 0
+                    print("  %s %s -t: %s" % (c("ok  ", "green") if ok else c("FAIL", "red"), tester[0], (err or out).strip().splitlines()[-1] if (err or out).strip() else ""))
+                    if not ok:
+                        print(c("  Apache config test failed: removing %s" % target, "red"))
+                        ctx.remove(target)
+                        changes.remove(target)
+                        if ctx.which("a2disconf"):
+                            ctx.run(["a2disconf", APACHE_CONF_NAME[:-5]], timeout=30)
+                    break
+    return planned, changes
+
+
 def cmd_protect(args):
     apply_ = args.apply
+    docker = args.docker or bool(args.container)
     if args.rollback:
         return protect_rollback(args)
     if not args.post_max and args.upload_max:
@@ -1673,86 +2416,16 @@ def cmd_protect(args):
     if args.post_max and not args.upload_max:
         pm = ini_bytes(args.post_max) or 0
         args.upload_max = "%dM" % max(1, (pm // (1024 ** 2)) - 2) if pm >= 3 * 1024 ** 2 else args.post_max
-    if apply_ and not is_root() and os.name != "nt":
+    if apply_ and not docker and not is_root() and os.name != "nt":
         print(c("protect --apply needs root to write configuration and restart services", "red"))
         return 3
-    banner("%s protect (%s)" % (TOOL, "APPLY" if apply_ else "DRY RUN - add --apply to write"))
+    banner("%s protect%s (%s)" % (TOOL, " --docker" if docker else "", "APPLY" if apply_ else "DRY RUN - add --apply to write"))
     print("  Interim mitigations from the php.net advisory. They reduce exposure; only updating PHP is complete.\n")
 
-    confd = discover_confd_dirs()
-    pools = discover_fpm_pools()
-    adir = discover_apache_dir()
-    has_85 = any((parse_version(php_version_of(b["path"], binary_kind(b["path"]))[0] or "") or (0, 0))[:2] == (8, 5)
-                 for b in find_php_binaries() if not b.get("unreadable"))
-    changes = []
+    if docker:
+        return protect_docker(args, apply_)
 
-    text = dropin_text(args)
-    print("php.ini drop-in (%s):" % DROPIN_NAME)
-    print("".join("    " + l + "\n" for l in text.splitlines()))
-    for d in confd:
-        if d.startswith("!"):
-            print("  %s %s has no scan dir; add the directives to it by hand" % (sev("MEDIUM"), d[1:]))
-            continue
-        target = os.path.join(d, DROPIN_NAME)
-        exists = os.path.exists(target)
-        print("  %s %s" % ("update " if exists else "write  ", target))
-        if apply_:
-            with open(target, "w") as fh:
-                fh.write(text)
-            os.chmod(target, 0o644)
-            changes.append(target)
-    if not confd:
-        print("  no conf.d directories found")
-
-    print("\nFPM pools (php_admin_* lines inserted under each [pool] header):")
-    for p in pools:
-        try:
-            with open(p, "r", errors="replace") as fh:
-                content = fh.read()
-        except OSError as e:
-            print("  skip %s (%s)" % (p, e))
-            continue
-        is85 = has_85 and ("8.5" in p)
-        block = fpm_block_lines(args, is85)
-        new = insert_fpm_block(content, block)
-        if new == content:
-            print("  unchanged %s" % p)
-            continue
-        print("  %s %s" % ("patch  " if not args.no_fpm_pools else "skip   ", p))
-        if apply_ and not args.no_fpm_pools:
-            bak = p + ".php2shell-guard.bak"
-            if not os.path.exists(bak):
-                shutil.copy2(p, bak)
-            with open(p, "w") as fh:
-                fh.write(new)
-            changes.append(p)
-    if not pools:
-        print("  no pool files found")
-
-    print("\nApache (mod_php) config:")
-    if adir and not args.no_apache:
-        target = os.path.join(adir, APACHE_CONF_NAME)
-        print("  write   %s" % target)
-        print("".join("    " + l + "\n" for l in apache_conf_text(args, has_85).splitlines()))
-        if apply_:
-            with open(target, "w") as fh:
-                fh.write(apache_conf_text(args, has_85))
-            changes.append(target)
-            if adir == "/etc/apache2/conf-available" and which("a2enconf"):
-                run(["a2enconf", APACHE_CONF_NAME[:-5]], timeout=30)
-            for tester in (("apachectl", "-t"), ("apache2ctl", "-t"), ("httpd", "-t")):
-                if which(tester[0]):
-                    rc, out, err = run(list(tester), timeout=30)
-                    ok = rc == 0
-                    print("  %s %s -t: %s" % (c("ok  ", "green") if ok else c("FAIL", "red"), tester[0], (err or out).strip().splitlines()[-1] if (err or out).strip() else ""))
-                    if not ok:
-                        print(c("  Apache config test failed: removing %s" % target, "red"))
-                        os.remove(target)
-                        if which("a2disconf"):
-                            run(["a2disconf", APACHE_CONF_NAME[:-5]], timeout=30)
-                    break
-    else:
-        print("  no Apache config dir found (or --no-apache)")
+    planned, changes = protect_target(args, HOST, find_php_binaries(), apply_)
 
     print("\nServices:")
     svcs = php_services()
@@ -1773,6 +2446,41 @@ def cmd_protect(args):
             print(c("Workers still run the old configuration until restarted.", "yellow"))
     else:
         print("Dry run complete. Re-run with --apply (as root) to write these changes.")
+    return 0
+
+
+def protect_docker(args, apply_):
+    targets, without, err = docker_php_targets(args.container)
+    if err:
+        print(c("  %s" % err, "yellow"))
+    if without and not args.container:
+        print("  no PHP in: %s" % ", ".join(without))
+    if not targets:
+        print("  no running container with PHP found")
+        return 3 if err else 0
+    changes = []
+    for ct, bins in targets:
+        print()
+        banner("container %s (%s)" % (ct.name, ct.image))
+        planned, ch = protect_target(args, ct, bins, apply_)
+        changes += ch
+        print("\nWorkers:")
+        if args.restart:
+            reload_container(ct, dry=not apply_)
+        else:
+            print("  (add --restart to reload PHP-FPM / Apache inside the container)")
+        if apply_ and ch:
+            print("\nPersistence:")
+            container_persistence_note(ct, ch)
+    print()
+    if apply_:
+        print(c("Applied %d change(s) in %d container(s)." % (len(changes), len(targets)), "green"))
+        print("Verify with: %s scan --docker" % sys.argv[0])
+        if not args.restart:
+            print(c("Workers still run the old configuration until reloaded (--restart).", "yellow"))
+    else:
+        print("Dry run complete. Re-run with --apply to write these changes (docker access is enough, no root).")
+        print("Changes made inside a container last until it is recreated; --apply explains how to keep them.")
     return 0
 
 
@@ -1801,47 +2509,71 @@ def insert_fpm_block(content, block):
     return "\n".join(out) + "\n"
 
 
-def protect_rollback(args):
-    apply_ = args.apply
-    banner("%s protect --rollback (%s)" % (TOOL, "APPLY" if apply_ else "DRY RUN"))
-    if apply_ and not is_root() and os.name != "nt":
-        print(c("needs root", "red"))
-        return 3
+def rollback_target(ctx, bins, apply_):
+    """Remove (or list) everything protect wrote on one target; returns the count."""
     n = 0
-    for d in discover_confd_dirs():
+
+    def act(fn, *a):
+        if not apply_:
+            return
+        try:
+            fn(*a)
+        except (OSError, IOError) as e:
+            print("    %s %s" % (c("FAIL", "red"), e))
+
+    for d in discover_confd_dirs(ctx, bins):
         if d.startswith("!"):
             continue
-        t = os.path.join(d, DROPIN_NAME)
-        if os.path.exists(t):
-            print("  remove %s" % t)
+        t = ctx.join(d, DROPIN_NAME)
+        if ctx.exists(t):
+            print("  remove %s" % ctx.where(t))
             n += 1
-            if apply_:
-                os.remove(t)
-    for p in discover_fpm_pools():
-        try:
-            with open(p, "r", errors="replace") as fh:
-                content = fh.read()
-        except OSError:
+            act(ctx.remove, t)
+    for p in discover_fpm_pools(ctx):
+        content = ctx.read_text(p)
+        if content is None or MARK_BEGIN not in content:
             continue
-        if MARK_BEGIN not in content:
-            continue
-        new = insert_fpm_block(content, [])
         # insert_fpm_block with empty block re-adds nothing but strips the old block
-        print("  strip  %s" % p)
+        print("  strip  %s" % ctx.where(p))
         n += 1
-        if apply_:
-            with open(p, "w") as fh:
-                fh.write(new)
-    adir = discover_apache_dir()
+        act(ctx.write_text, p, insert_fpm_block(content, []))
+    adir = discover_apache_dir(ctx)
     if adir:
-        t = os.path.join(adir, APACHE_CONF_NAME)
-        if os.path.exists(t):
-            print("  remove %s" % t)
+        t = ctx.join(adir, APACHE_CONF_NAME)
+        if ctx.exists(t):
+            print("  remove %s" % ctx.where(t))
             n += 1
-            if apply_:
-                if which("a2disconf"):
-                    run(["a2disconf", APACHE_CONF_NAME[:-5]], timeout=30)
-                os.remove(t)
+            if apply_ and ctx.which("a2disconf"):
+                ctx.run(["a2disconf", APACHE_CONF_NAME[:-5]], timeout=30)
+            act(ctx.remove, t)
+    return n
+
+
+def protect_rollback(args):
+    apply_ = args.apply
+    docker = args.docker or bool(args.container)
+    banner("%s protect --rollback%s (%s)" % (TOOL, " --docker" if docker else "", "APPLY" if apply_ else "DRY RUN"))
+    if apply_ and not docker and not is_root() and os.name != "nt":
+        print(c("needs root", "red"))
+        return 3
+    if docker:
+        targets, without, err = docker_php_targets(args.container)
+        if err:
+            print(c("  %s" % err, "yellow"))
+        n = 0
+        for ct, bins in targets:
+            print(c("container %s (%s)" % (ct.name, ct.image), "bold"))
+            k = rollback_target(ct, bins, apply_)
+            n += k
+            if not k:
+                print("  nothing to remove")
+            if args.restart:
+                reload_container(ct, dry=not apply_)
+            elif apply_ and k:
+                print(c("  reload with --restart so workers drop the mitigation config", "yellow"))
+        print("\n%d item(s) %s." % (n, "removed" if apply_ else "would be removed"))
+        return 0
+    n = rollback_target(HOST, find_php_binaries(), apply_)
     print("\n%d item(s) %s." % (n, "removed" if apply_ else "would be removed"))
     if args.restart:
         print("Services:")
@@ -1872,9 +2604,13 @@ WEBSHELL_PATTERNS = [
     re.compile(rb"preg_replace\s*\(\s*['\"][^'\"]*/e['\"]", re.I),
     re.compile(rb"(?:create_function|array_map|call_user_func(?:_array)?)\s*\(\s*(?:\$_(?:GET|POST|REQUEST)|['\"](?:system|exec|shell_exec|passthru)['\"])", re.I),
     re.compile(rb"\bmove_uploaded_file\s*\(\s*\$_FILES\[[^\]]+\]\[.tmp_name.\]\s*,\s*\$_(?:GET|POST|REQUEST)", re.I),
-    re.compile(rb"(?:c99|r57|wso|b374k|FilesMan|WebShell|phpspy|uname -a;)", re.I),
+    # known kits by their own identifiers; bare "c99"/"wso" also hit hashes and names like shouldShowSocial
+    re.compile(rb"(?:\bc99(?:shell|sh_|_buff)|\br57(?:shell|_)|\bWSO(?:setcookie|_version|\s?\d\.\d)|\bb374k\b|\bFilesMan\b|\bphpspy\b|uname -a;)", re.I),
 ]
 SESSION_INJECT_RE = re.compile(rb"<\?php|<\?=|<script language=\"php\"|\|O:\d+:\"|upload_progress_[^|]*<\?")
+
+
+WEB_EXTS = (".php", ".phtml", ".php5", ".php7", ".php8", ".phar", ".inc", ".phps")
 
 
 def open_log(path):
@@ -1883,8 +2619,30 @@ def open_log(path):
     return open(path, "rb")
 
 
-def hunt_logs(paths, since, max_lines=2000000):
-    hits, files = {}, []
+def match_log_lines(lines, source, hits):
+    """Count LOG_PATTERNS hits from an iterable of text lines into hits."""
+    n = 0
+    for line in lines:
+        n += 1
+        for sev_, name, rx in LOG_PATTERNS:
+            if rx.search(line):
+                h = hits.setdefault(name, {"severity": sev_, "count": 0, "files": set(), "samples": []})
+                h["count"] += 1
+                h["files"].add(source)
+                if len(h["samples"]) < 5:
+                    h["samples"].append(line.strip()[:300])
+                break
+    return n
+
+
+def finish_log_hits(hits):
+    for h in hits.values():
+        h["files"] = sorted(h["files"])
+    return hits
+
+
+def hunt_logs(paths, since, max_lines=2000000, hits=None):
+    hits, files = ({} if hits is None else hits), []
     for p in paths:
         try:
             if os.path.getmtime(p) < since.timestamp() or os.path.getsize(p) == 0:
@@ -1894,41 +2652,35 @@ def hunt_logs(paths, since, max_lines=2000000):
         files.append(p)
         try:
             with open_log(p) as fh:
-                for n, raw in enumerate(fh):
-                    if n > max_lines:
-                        break
-                    line = raw.decode("utf-8", "replace")
-                    for sev_, name, rx in LOG_PATTERNS:
-                        if rx.search(line):
-                            h = hits.setdefault(name, {"severity": sev_, "count": 0, "files": set(), "samples": []})
-                            h["count"] += 1
-                            h["files"].add(p)
-                            if len(h["samples"]) < 5:
-                                h["samples"].append(line.strip()[:300])
-                            break
+                match_log_lines((raw.decode("utf-8", "replace") for raw in itertools.islice(fh, max_lines + 1)), p, hits)
         except OSError:
             continue
-    for h in hits.values():
-        h["files"] = sorted(h["files"])
-    return hits, files
+    return finish_log_hits(hits), files
 
 
-def session_dirs_from_scan():
+def session_dirs_from_scan(ctx=None, bins=None):
+    ctx = ctx or HOST
     dirs = set()
-    for b in find_php_binaries():
+    for b in (find_php_binaries() if bins is None else bins):
         kind = binary_kind(b["path"])
         if kind == "module" or b.get("unreadable"):
             continue
-        conf, info, _ = effective_ini_from_binary(b["path"], kind)
+        conf, info, _ = effective_ini_from_binary(b["path"], kind, ctx)
         if conf and conf.get("session.save_path"):
             sp = conf["session.save_path"][0]
             m = re.search(r"(?:\d+;)?(?:\d+;)?(/\S+)$", sp)
-            if m and os.path.isdir(m.group(1)):
+            if m and ctx.isdir(m.group(1)):
                 dirs.add(m.group(1))
-    for d in expand_globs(SESSION_DIR_CANDIDATES):
-        if os.path.isdir(d):
-            dirs.add(d)
+    dirs.update(ctx.existing(SESSION_DIR_CANDIDATES, "d"))
     return sorted(dirs)
+
+
+def session_hit(label, data, mtime):
+    m = SESSION_INJECT_RE.search(data)
+    if not m:
+        return None
+    return {"file": label, "size": len(data), "mtime": datetime.datetime.fromtimestamp(mtime).isoformat(),
+            "match": m.group(0).decode("latin-1")[:40]}
 
 
 def hunt_sessions(dirs, max_files=50000):
@@ -1947,15 +2699,33 @@ def hunt_sessions(dirs, max_files=50000):
                     continue
                 with open(p, "rb") as fh:
                     data = fh.read()
+                mtime = os.path.getmtime(p)
             except OSError:
                 continue
             scanned += 1
-            m = SESSION_INJECT_RE.search(data)
-            if m:
-                hits.append({"file": p, "size": len(data), "mtime": datetime.datetime.fromtimestamp(os.path.getmtime(p)).isoformat(),
-                             "match": m.group(0).decode("latin-1")[:40]})
+            h = session_hit(p, data, mtime)
+            if h:
+                hits.append(h)
             if scanned >= max_files:
                 return hits, scanned
+    return hits, scanned
+
+
+def hunt_sessions_in_container(ct, d, max_files=50000):
+    hits, scanned = [], 0
+    top = d.rstrip("/")
+
+    def want(cpath, size):
+        return posixpath.dirname(cpath) == top and posixpath.basename(cpath).startswith("sess_") and size <= 5 * 1024 * 1024
+
+    with contextlib.closing(docker_tar_members(ct, d, want)) as members:
+        for cpath, mtime, size, fh in members:
+            scanned += 1
+            h = session_hit("%s:%s" % (ct.name, cpath), fh.read(), mtime)
+            if h:
+                hits.append(h)
+            if scanned >= max_files:
+                break
     return hits, scanned
 
 
@@ -1974,58 +2744,132 @@ def detect_webroots():
         for p in glob.glob(d):
             if os.path.isdir(p):
                 roots.add(p.rstrip("/"))
-    # collapse nested roots
+    return collapse_roots(roots)
+
+
+def collapse_roots(roots):
     out = []
     for r in sorted(roots):
-        if not any(r.startswith(o + "/") for o in out):
+        if not any(r.startswith(o.rstrip("/") + "/") for o in out):
             out.append(r)
     return out
 
 
+def check_web_file(label, name, mtime, size, read, since, recent, suspicious):
+    """Recent-PHP and webshell checks for one file; read() returns its bytes."""
+    lower = name.lower()
+    is_php = lower.endswith(WEB_EXTS) or ".php." in lower
+    if is_php and mtime >= since.timestamp():
+        recent.append({"file": label, "mtime": datetime.datetime.fromtimestamp(mtime).isoformat(), "size": size})
+    if (is_php or lower.endswith((".ico", ".txt", ".jpg", ".png"))) and size < 2 * 1024 * 1024:
+        try:
+            data = read()
+        except OSError:
+            return
+        if not is_php and b"<?php" not in data:
+            return
+        for rx in WEBSHELL_PATTERNS:
+            m = rx.search(data)
+            if m:
+                suspicious.append({"file": label, "pattern": m.group(0).decode("latin-1")[:60],
+                                   "sha256": hashlib.sha256(data).hexdigest(),
+                                   "mtime": datetime.datetime.fromtimestamp(mtime).isoformat()})
+                break
+
+
+WEBROOT_SKIP_DIRS = ("node_modules", ".git", "vendor")
+
+
+def _read_file(p):
+    with open(p, "rb") as fh:
+        return fh.read()
+
+
 def hunt_webroots(roots, since, max_files=300000):
     recent, suspicious, n = [], [], 0
-    exts = (".php", ".phtml", ".php5", ".php7", ".php8", ".phar", ".inc", ".phps")
     for root in roots:
         for dp, dns, fns in os.walk(root):
-            dns[:] = [d for d in dns if d not in ("node_modules", ".git", "vendor") or d == "vendor" and False]
+            dns[:] = [d for d in dns if d not in WEBROOT_SKIP_DIRS]
             for f in fns:
                 n += 1
                 if n > max_files:
                     return recent, suspicious, n
                 p = os.path.join(dp, f)
-                lower = f.lower()
                 try:
                     st = os.lstat(p)
                 except OSError:
                     continue
                 if not stat.S_ISREG(st.st_mode):
                     continue
-                is_php = lower.endswith(exts) or ".php." in lower
-                if is_php and st.st_mtime >= since.timestamp():
-                    recent.append({"file": p, "mtime": datetime.datetime.fromtimestamp(st.st_mtime).isoformat(), "size": st.st_size})
-                if (is_php or lower.endswith((".ico", ".txt", ".jpg", ".png"))) and st.st_size < 2 * 1024 * 1024:
-                    try:
-                        with open(p, "rb") as fh:
-                            data = fh.read()
-                    except OSError:
-                        continue
-                    if not is_php and b"<?php" not in data:
-                        continue
-                    for rx in WEBSHELL_PATTERNS:
-                        m = rx.search(data)
-                        if m:
-                            suspicious.append({"file": p, "pattern": m.group(0).decode("latin-1")[:60],
-                                               "sha256": hashlib.sha256(data).hexdigest(),
-                                               "mtime": datetime.datetime.fromtimestamp(st.st_mtime).isoformat()})
-                            break
+                check_web_file(p, f, st.st_mtime, st.st_size, lambda p=p: _read_file(p), since, recent, suspicious)
     return recent, suspicious, n
 
 
-def hunt_processes():
-    procs = running_processes()
+def hunt_webroot_in_container(ct, root, since, max_files=300000):
+    recent, suspicious = [], []
+    count = [0]
+
+    def want(cpath, size):
+        if any(part in WEBROOT_SKIP_DIRS for part in cpath.split("/")):
+            return False
+        count[0] += 1
+        return True
+
+    with contextlib.closing(docker_tar_members(ct, root, want)) as members:
+        for cpath, mtime, size, fh in members:
+            check_web_file("%s:%s" % (ct.name, cpath), posixpath.basename(cpath), mtime, size, fh.read, since, recent, suspicious)
+            if count[0] > max_files:
+                break
+    return recent, suspicious, count[0]
+
+
+def container_webroots(ct, explicit=None):
+    """(host dirs behind bind mounts, dirs to stream out of the container)."""
+    on_host, inside = [], []
+    if explicit:
+        for d in explicit:
+            hp = ct.host_path(d)
+            (on_host if hp and os.path.isdir(hp) else inside).append(hp if hp and os.path.isdir(hp) else d)
+        return on_host, inside
+    for m in ct.mounts:
+        d = m["destination"].rstrip("/")
+        if not d or any(d == x or d.startswith(x + "/") for x in DOCKER_NON_CODE_MOUNTS):
+            continue
+        hp = ct.host_path(d)
+        if hp and os.path.isdir(hp):
+            on_host.append(hp)
+        elif m["type"] == "volume" and ct.isdir(d):
+            inside.append(d)
+    mount_dests = [m["destination"].rstrip("/") for m in ct.mounts]
+    for cand in DOCKER_WEBROOT_CANDIDATES:
+        if any(cand == d or cand.startswith(d + "/") for d in mount_dests):
+            continue  # covered by a mount
+        if any(d.startswith(cand + "/") for d in mount_dests):
+            continue  # docker cp would pull the mount in as well; the mount is scanned on its own
+        if ct.isdir(cand):
+            inside.append(cand)
+    return on_host, collapse_roots(inside)
+
+
+def is_web_worker(comm):
+    return comm in WEB_WORKER_NAMES or comm == "php" or bool(BIN_NAME_RE.match(comm)) or \
+        comm.startswith(("php-fpm", "lsphp", "apache", "httpd"))
+
+
+def find_shell_children(procs):
+    """Shells / interpreters whose parent is a PHP or web server worker."""
     by_pid = {p["pid"]: p for p in procs}
-    # need all processes for children; on Linux re-read /proc minimal
-    sus = []
+    out = []
+    for p in procs:
+        parent = by_pid.get(p["ppid"])
+        if parent and os.path.basename(p["comm"]) in SHELL_NAMES and is_web_worker(parent["comm"]):
+            out.append({"pid": p["pid"], "comm": p["comm"], "cmdline": (p.get("cmdline") or "")[:200],
+                        "parent": "%s[%d]" % (parent["comm"], parent["pid"])})
+    return out
+
+
+def hunt_processes():
+    procs = []
     if os.path.isdir("/proc") and platform.system() == "Linux":
         for pid in os.listdir("/proc"):
             if not pid.isdigit():
@@ -2039,20 +2883,18 @@ def hunt_processes():
                     cmd = fh.read().replace(b"\0", b" ").decode("utf-8", "replace").strip()
             except (OSError, ValueError):
                 continue
-            parent = by_pid.get(ppid)
-            if parent and os.path.basename(comm) in SHELL_NAMES and parent["comm"] in WEB_WORKER_NAMES + ("php",):
-                sus.append({"pid": int(pid), "comm": comm, "cmdline": cmd[:200], "parent": "%s[%d]" % (parent["comm"], ppid)})
+            procs.append({"pid": int(pid), "ppid": ppid, "comm": comm, "cmdline": cmd})
     else:
         rc, out, _ = run(["ps", "-axo", "pid=,ppid=,comm="], timeout=15)
         for line in out.splitlines():
             parts = line.split(None, 2)
             if len(parts) < 3:
                 continue
-            pid, ppid, comm = int(parts[0]), int(parts[1]), os.path.basename(parts[2])
-            parent = by_pid.get(ppid)
-            if parent and comm in SHELL_NAMES and parent["comm"] in WEB_WORKER_NAMES:
-                sus.append({"pid": pid, "comm": comm, "cmdline": "", "parent": "%s[%d]" % (parent["comm"], ppid)})
-    return sus
+            try:
+                procs.append({"pid": int(parts[0]), "ppid": int(parts[1]), "comm": os.path.basename(parts[2]), "cmdline": ""})
+            except ValueError:
+                continue
+    return find_shell_children(procs)
 
 
 def hunt_persistence(since):
@@ -2078,8 +2920,35 @@ def hunt_persistence(since):
     return out
 
 
-def cmd_hunt(args):
-    since = datetime.datetime.now() - datetime.timedelta(days=args.days)
+def hunt_findings(r, days, since, prefix=""):
+    """Findings for one hunt report (the host or one container)."""
+    pre = prefix + ": " if prefix else ""
+    f = []
+    for name, h in r["logs"].items():
+        f.append({"severity": h["severity"], "title": "%s%s: %d log line(s) in %d source(s)" % (pre, name, h["count"], len(h["files"])),
+                  "detail": "; ".join(h["samples"][:2])})
+    for s in r["session_hits"]:
+        f.append({"severity": "CRITICAL", "title": "session file contains PHP/serialized-object marker: %s" % s["file"], "detail": "match %r, mtime %s" % (s["match"], s["mtime"])})
+    for s in r["suspicious_files"]:
+        f.append({"severity": "CRITICAL", "title": "webshell-like code in %s" % s["file"], "detail": "pattern %r sha256 %s" % (s["pattern"], s["sha256"][:16])})
+    if r["recent_php_files"]:
+        f.append({"severity": "MEDIUM", "title": "%s%d PHP file(s) modified in the last %d day(s) under %s" % (pre, len(r["recent_php_files"]), days, ", ".join(r["webroots"])),
+                  "detail": "; ".join(x["file"] for x in r["recent_php_files"][:5])})
+    for s in r["shell_children"]:
+        f.append({"severity": "CRITICAL", "title": "%sweb worker %s spawned %s (pid %d)" % (pre, s["parent"], s["comm"], s["pid"]), "detail": s["cmdline"]})
+    if r.get("persistence"):
+        f.append({"severity": "LOW", "title": "%d persistence-related file(s) changed since %s" % (len(r["persistence"]), since.date()),
+                  "detail": "; ".join(x["file"] for x in r["persistence"][:6])})
+    if r.get("layer_php"):
+        f.append({"severity": "MEDIUM", "title": "%s%d PHP file(s) written into the container layer (not in the image, not on a mount)" % (pre, len(r["layer_php"])),
+                  "detail": "; ".join(r["layer_php"][:6]) + " (framework caches such as compiled views also land here)"})
+    if r.get("layer_persistence"):
+        f.append({"severity": "MEDIUM", "title": "%spersistence-related path(s) changed in the container layer" % pre,
+                  "detail": "; ".join(r["layer_persistence"][:6])})
+    return f
+
+
+def hunt_host(args, since):
     report = {"tool": TOOL, "version": __version__, "host": socket.gethostname(), "since": since.isoformat(), "logs": {},
               "log_files": [], "session_dirs": [], "session_hits": [], "sessions_scanned": 0, "webroots": [],
               "recent_php_files": [], "suspicious_files": [], "shell_children": [], "persistence": [], "findings": []}
@@ -2095,31 +2964,121 @@ def cmd_hunt(args):
         report["recent_php_files"], report["suspicious_files"], report["files_scanned"] = hunt_webroots(roots, since)
     report["shell_children"] = hunt_processes()
     report["persistence"] = hunt_persistence(since)
+    report["findings"] = hunt_findings(report, args.days, since)
+    report["summary"] = ["logs scanned: %d   session dirs: %s   webroots: %s   sessions scanned: %d" % (
+        len(files), ", ".join(sdirs) or "-", ", ".join(roots) or "-", report["sessions_scanned"])]
+    return report
 
+
+def hunt_container(ct, bins, since, args, seen):
+    """Hunt one container. seen holds host paths already scanned through
+    another container's bind mount (several services often share one)."""
+    r = {"name": ct.name, "id": ct.id, "image": ct.image, "logs": {}, "log_sources": [], "session_dirs": [],
+         "session_hits": [], "sessions_scanned": 0, "webroots": [], "recent_php_files": [], "suspicious_files": [],
+         "files_scanned": 0, "shell_children": [], "layer_php": [], "layer_persistence": []}
+
+    def first_time(host_path):
+        key = os.path.realpath(host_path)
+        if key in seen:
+            return False
+        seen.add(key)
+        return True
+
+    hits = {}
+    n = match_log_lines(stream_lines(["docker", "logs", "--since", "%dh" % (args.days * 24), ct.full_id], merge_stderr=True),
+                        "%s (docker logs)" % ct.name, hits)
+    r["log_sources"].append("docker logs (%d lines)" % n)
+    for path, mtime, size in ct.stat_files(args.logs or ERROR_LOG_GLOBS):
+        if mtime < since.timestamp() or size == 0:
+            continue
+        hp = ct.host_path(path)
+        if hp and os.path.isfile(hp):
+            if first_time(hp):
+                hunt_logs([hp], since, hits=hits)
+                r["log_sources"].append(hp)
+        else:
+            label = "%s:%s" % (ct.name, path)
+            match_log_lines(stream_lines(["docker", "exec", ct.full_id, "cat", path], gz=path.endswith(".gz")), label, hits)
+            r["log_sources"].append(label)
+    r["logs"] = finish_log_hits(hits)
+
+    if bins:
+        r["session_dirs"] = args.session_dir or session_dirs_from_scan(ct, bins)
+        for d in r["session_dirs"]:
+            hp = ct.host_path(d)
+            if hp and os.path.isdir(hp):
+                if not first_time(hp):
+                    continue
+                h, k = hunt_sessions([hp])
+            else:
+                h, k = hunt_sessions_in_container(ct, d)
+            r["session_hits"] += h
+            r["sessions_scanned"] += k
+
+    if not args.no_webroot:
+        on_host, inside = container_webroots(ct, args.webroot)
+        for root in on_host:
+            if not first_time(root):
+                continue
+            rec, sus, k = hunt_webroots([root], since)
+            r["webroots"].append(root)
+            r["recent_php_files"] += rec
+            r["suspicious_files"] += sus
+            r["files_scanned"] += k
+        for root in inside:
+            rec, sus, k = hunt_webroot_in_container(ct, root, since)
+            r["webroots"].append("%s:%s" % (ct.name, root))
+            r["recent_php_files"] += rec
+            r["suspicious_files"] += sus
+            r["files_scanned"] += k
+
+    r["shell_children"] = find_shell_children(ct.processes())
+    rc, out, _ = run(["docker", "diff", ct.full_id], timeout=120)
+    if rc == 0:
+        r["layer_php"], r["layer_persistence"] = classify_layer_changes(out.splitlines())
+    return r
+
+
+def hunt_docker(args, since):
+    report = {"tool": TOOL, "version": __version__, "host": socket.gethostname(), "since": since.isoformat(),
+              "containers": [], "skipped": [], "docker_error": None, "findings": [], "summary": []}
+    cts, err = docker_containers(args.container)
+    report["docker_error"] = err
+    seen = set()
+    for ct in cts:
+        bins = ct.php_binaries()
+        web = bins or DOCKER_WEB_RE.search(ct.name + " " + ct.image) or any(is_web_worker(p["comm"]) for p in ct.processes())
+        if not web and not args.container:
+            report["skipped"].append(ct.name)
+            continue
+        r = hunt_container(ct, bins, since, args, seen)
+        report["containers"].append(r)
+        report["findings"] += hunt_findings(r, args.days, since, prefix=ct.name)
+        report["summary"].append("%-16s logs: %s | sessions: %d in %s | webroots: %s (%d files)" % (
+            ct.name, ", ".join(r["log_sources"]) or "-", r["sessions_scanned"], ", ".join(r["session_dirs"]) or "-",
+            ", ".join(r["webroots"]) or "-", r["files_scanned"]))
+    if err:
+        report["summary"].insert(0, c(err, "yellow"))
+    if report["skipped"]:
+        report["summary"].append("not a PHP or web container, skipped: %s" % ", ".join(report["skipped"]))
+    if not report["containers"]:
+        report["summary"].append("no running PHP or web server container found")
+    return report
+
+
+def cmd_hunt(args):
+    since = datetime.datetime.now() - datetime.timedelta(days=args.days)
+    docker = args.docker or bool(args.container)
+    report = hunt_docker(args, since) if docker else hunt_host(args, since)
     f = report["findings"]
-    for name, h in hits.items():
-        f.append({"severity": h["severity"], "title": "%s: %d log line(s) in %d file(s)" % (name, h["count"], len(h["files"])),
-                  "detail": "; ".join(h["samples"][:2])})
-    for s in report["session_hits"]:
-        f.append({"severity": "CRITICAL", "title": "session file contains PHP/serialized-object marker: %s" % s["file"], "detail": "match %r, mtime %s" % (s["match"], s["mtime"])})
-    for s in report["suspicious_files"]:
-        f.append({"severity": "CRITICAL", "title": "webshell-like code in %s" % s["file"], "detail": "pattern %r sha256 %s" % (s["pattern"], s["sha256"][:16])})
-    if report["recent_php_files"]:
-        f.append({"severity": "MEDIUM", "title": "%d PHP file(s) modified in the last %d day(s) under %s" % (len(report["recent_php_files"]), args.days, ", ".join(roots)),
-                  "detail": "; ".join(x["file"] for x in report["recent_php_files"][:5])})
-    for s in report["shell_children"]:
-        f.append({"severity": "CRITICAL", "title": "web worker %s spawned %s (pid %d)" % (s["parent"], s["comm"], s["pid"]), "detail": s["cmdline"]})
-    if report["persistence"]:
-        f.append({"severity": "LOW", "title": "%d persistence-related file(s) changed since %s" % (len(report["persistence"]), since.date()),
-                  "detail": "; ".join(x["file"] for x in report["persistence"][:6])})
     f.sort(key=lambda x: SEV_RANK.get(x["severity"], 9))
 
     if args.json:
         print(json.dumps(report, indent=2, default=str))
     else:
-        banner("%s hunt - %s (window: since %s)" % (TOOL, report["host"], since.strftime("%Y-%m-%d")))
-        print("  logs scanned: %d   session dirs: %s   webroots: %s   sessions scanned: %d" % (
-            len(files), ", ".join(sdirs) or "-", ", ".join(roots) or "-", report["sessions_scanned"]))
+        banner("%s hunt - %s%s (window: since %s)" % (TOOL, report["host"], " docker containers" if docker else "", since.strftime("%Y-%m-%d")))
+        for line in report["summary"]:
+            print("  " + line)
         print()
         if not f:
             print(c("  no exploitation indicators found (absence of evidence is not proof; keep logs)", "green"))
@@ -2554,7 +3513,10 @@ def build_parser():
     s = sub.add_parser("scan", help="audit this host for unpatched PHP runtimes and risky configuration")
     s.add_argument("--json", action="store_true", help="print the full report as JSON")
     s.add_argument("-o", "--output", help="also write the JSON report to this file")
-    s.add_argument("--docker", action="store_true", help="also inspect running Docker containers")
+    s.add_argument("--docker", action="store_true",
+                   help="also inspect PHP inside every running Docker container (version, patch markers, ini, FPM pools, packages)")
+    s.add_argument("--container", action="append", metavar="NAME",
+                   help="only this container (name or id prefix; repeatable; implies --docker)")
     s.add_argument("--no-config", action="store_true", help="skip effective-ini and FPM pool checks (faster)")
 
     s = sub.add_parser("protect", help="apply php.net interim mitigations (dry run unless --apply)")
@@ -2567,6 +3529,10 @@ def build_parser():
     s.add_argument("--nesting", type=int, default=32, help="max_input_nesting_level when --post-max is set (default 32)")
     s.add_argument("--no-fpm-pools", action="store_true", help="do not insert php_admin_* lines into FPM pool files")
     s.add_argument("--no-apache", action="store_true", help="do not write the Apache mod_php conf")
+    s.add_argument("--docker", action="store_true",
+                   help="work inside running Docker containers (docker exec) instead of on this host; no root needed")
+    s.add_argument("--container", action="append", metavar="NAME",
+                   help="only this container (name or id prefix; repeatable; implies --docker)")
 
     s = sub.add_parser("hunt", help="look for exploitation traces on this host")
     s.add_argument("--days", type=int, default=14, help="look-back window for logs/files (default 14; exploitation began 2026-10-17)")
@@ -2574,6 +3540,12 @@ def build_parser():
     s.add_argument("--session-dir", nargs="*", help="session save paths to scan (default: from PHP config + common paths)")
     s.add_argument("--webroot", nargs="*", help="document roots to scan (default: from web server config + common paths)")
     s.add_argument("--no-webroot", action="store_true", help="skip webroot file scan")
+    s.add_argument("--docker", action="store_true",
+                   help="hunt inside running PHP / web server containers instead of on this host "
+                        "(docker logs, sessions, webroots, processes, container-layer changes); "
+                        "--logs/--session-dir/--webroot then name paths inside the containers")
+    s.add_argument("--container", action="append", metavar="NAME",
+                   help="only this container (name or id prefix; repeatable; implies --docker)")
     s.add_argument("--json", action="store_true")
     s.add_argument("-o", "--output")
 

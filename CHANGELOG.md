@@ -1,5 +1,32 @@
 # Changelog
 
+## 1.1.0 - 2026-10-23
+
+Docker containers are first-class targets (contributed by @falconsw in #1, merged on
+top of 1.0.1's `/proc` detection).
+
+- `scan --docker` runs the full host assessment inside every running container through
+  `docker exec` (binaries, patch markers, running/stale workers, effective ini, FPM
+  pools, packages, Apache directives) with Compose-aware rebuild hints; `--container
+  NAME` narrows it. Containers already seen through `/proc` are reported once, in the
+  Docker section, with a cross-reference instead of a duplicate host entry.
+- When the host has no PHP of its own and `docker` is available, running containers are
+  still inspected automatically, in the cheap `--no-config` mode; `--docker` does the
+  deep pass.
+- `protect --docker` writes the drop-in, FPM pool blocks and Apache conf inside
+  containers, reloads FPM/Apache gracefully with `--restart` (verified by worker PIDs,
+  with a loud warning when it has to fall back to `docker restart`), supports
+  `--rollback`, and explains how to persist the change past a recreate.
+- `hunt --docker`: `docker logs`, in-container or bind-mounted error logs, session
+  files and webroots (streamed with `docker cp`, or walked on the host for bind mounts),
+  shells spawned by web workers, and `docker diff` checks for PHP and persistence files
+  in the writable layer.
+- `hunt`: the shell-family webshell signature no longer matches bare `c99`/`wso`
+  substrings (hashes in compiled Blade views, identifiers such as `shouldShowSocialIds`).
+- `hunt`: shells spawned by Debian-named workers (`php-fpm8.3`) are now recognised.
+- `quickcheck.sh`: busybox `tr -c` does not understand `[:print:]`; an octal range is
+  used for the marker fallback.
+
 ## 1.0.1 - 2026-10-23
 
 - `scan` finds PHP workers running inside containers from the host: their binaries are
