@@ -1,5 +1,29 @@
 # Changelog
 
+## 1.1.1 - 2026-10-23
+
+Fixes from the first production run on a host whose PHP lives only in containers.
+
+- `protect` (host mode) on a machine with no PHP of its own now writes nothing, names
+  the containers that do run PHP, points at `protect --docker`, and exits 2. It used to
+  write an Apache `php_admin_*` conf on the host, which does nothing when that Apache
+  has no mod_php, and report success.
+- `protect` never writes the Apache conf where no mod_php is found, on a host as in a
+  container (reverse-proxy Apache ignores `php_admin_*`).
+- `protect` and `hunt` in host mode no longer run container binaries reached through
+  `/proc/<pid>/root` (for `-v` / `-i` probes). Those binaries are only ever read, as the
+  1.0.1 notes promised; `php_version_of` and `effective_ini_from_binary` refuse such
+  paths outright.
+- One CRITICAL per unpatched runtime instead of one per binary and reason: the CLI,
+  FPM and Apache module of the same build are reported together with the single fix,
+  and the separate "EOL branch without a confirmed vendor backport" CRITICAL is folded
+  into it. Three PHP 8.0.1 containers now give 3 findings, not 12.
+- Inside containers that serve through FPM or mod_php, the CLI's (identical) ini
+  findings are no longer repeated.
+- `scan` marks an unpatched runtime whose effective configuration carries the interim
+  mitigations: `interim mitigations active: upload_progress off, memory_limit -1`
+  (with `--docker` or on the host; the automatic cheap container pass reads no ini).
+
 ## 1.1.0 - 2026-10-23
 
 Docker containers are first-class targets (contributed by @falconsw in #1, merged on

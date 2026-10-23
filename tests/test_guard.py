@@ -558,5 +558,141 @@ class ProcDockerDedupe(unittest.TestCase):
         self.assertEqual(covered, [])
 
 
+class NeverExecuteContainerBinaries(unittest.TestCase):
+    """1.1.1: host-mode code must not run binaries reached through /proc/<pid>/root."""
+
+    def test_guard_refuses_proc_root_paths(self):
+        calls = []
+        real = guard.run
+        guard.run = lambda cmd, **kw: calls.append(cmd) or (0, "PHP 8.0.1 (cli)", "")
+        try:
+            conf, info, note = guard.effective_ini_from_binary("/proc/4242/root/usr/local/sbin/php-fpm", "fpm")
+            self.assertIsNone(conf)
+            self.assertIn("not executed", note)
+            guard.php_version_of("/proc/4242/root/usr/local/bin/php", "cli")
+            self.assertEqual(calls, [], "a /proc/<pid>/root binary was executed")
+            guard.php_version_of("/usr/bin/php", "cli")
+            self.assertEqual(len(calls), 1)
+        finally:
+            guard.run = real
+
+    def test_host_binaries_drop_namespace_entries(self):
+        real = guard.find_php_binaries
+        guard.find_php_binaries = lambda: [{"path": "/usr/bin/php8.3", "sources": {"PATH"}},
+                                           {"path": "/proc/9/root/usr/local/sbin/php-fpm", "nsroot": True, "sources": {"container-process"}}]
+        try:
+            self.assertEqual([b["path"] for b in guard.host_binaries()], ["/usr/bin/php8.3"])
+        finally:
+            guard.find_php_binaries = real
+
+
+class ProtectOnContainersOnlyHost(unittest.TestCase):
+    def args(self, **kw):
+        import argparse
+        base = dict(apply=True, rollback=False, restart=False, post_max=None, upload_max=None, memory_unlimited=False,
+                    nesting=32, no_fpm_pools=False, no_apache=False, docker=False, container=None)
+        base.update(kw)
+        return argparse.Namespace(**base)
+
+    def test_writes_nothing_and_points_at_docker(self):
+        import contextlib
+        import io
+        saved = {k: getattr(guard, k) for k in ("find_php_binaries", "is_root", "which", "protect_target")}
+        wrote = []
+        guard.find_php_binaries = lambda: [{"path": "/proc/9/root/usr/local/sbin/php-fpm", "nsroot": True, "pids": [9],
+                                            "sources": {"container-process"}}]
+        guard.is_root = lambda: True
+        guard.which = lambda name: None
+        guard.protect_target = lambda *a, **kw: wrote.append(a) or ([], [])
+        out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out):
+                rc = guard.cmd_protect(self.args())
+        finally:
+            for k, v in saved.items():
+                setattr(guard, k, v)
+        self.assertEqual(rc, guard.PROTECT_NOTHING_RC)
+        self.assertEqual(wrote, [])
+        text = out.getvalue()
+        self.assertIn("No PHP runtime on this host itself", text)
+        self.assertIn("protect --docker", text)
+
+    def test_apache_conf_skipped_without_mod_php(self):
+        import contextlib
+        import io
+        ct = FakeContainer({"/usr/local/sbin/php-fpm": "ELF"}, {"/etc/apache2/conf-available", "/usr/local/etc/php/conf.d"},
+                           "Scan this dir for additional .ini files => /usr/local/etc/php/conf.d\n")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            planned, changes = guard.protect_target(ProtectOnContainer().args(), ct,
+                                                    [{"path": "/usr/local/sbin/php-fpm", "sources": {"PATH"}}], apply_=True)
+        self.assertNotIn("/etc/apache2/conf-available/" + guard.APACHE_CONF_NAME, ct.files)
+        self.assertIn("skipped: no mod_php", out.getvalue())
+
+
+class GroupedFindings(unittest.TestCase):
+    def inst(self, path, kind, version="8.0.1", status="eol", running=None, conf=None, pools=None):
+        reason = "branch 8.0 has no upstream fix (vendor backport required)" if status == "eol" else "%s < 8.3.36" % version
+        return {"path": path, "kind": kind, "version": version, "version_status": status, "version_reason": reason,
+                "verdict": "VULNERABLE", "running": running or [], "findings": [], "config": conf,
+                "sapi_configs": [], "fpm_pools": {"pools": pools or {}, "ok": True, "note": ""} if pools is not None else None}
+
+    def criticals(self, findings):
+        return [f for f in findings if f[0] == "CRITICAL"]
+
+    def test_one_critical_per_container_runtime(self):
+        d = {"name": "swordeye-web-php-1", "image": "swordeye-web-php", "compose": None, "packages": [], "apache": [],
+             "installs": [self.inst("/usr/local/bin/php", "cli"), self.inst("/usr/local/sbin/php-fpm", "fpm", running=[1])]}
+        crit = self.criticals(guard.container_findings(d))
+        self.assertEqual(len(crit), 1)
+        self.assertIn("fpm /usr/local/sbin/php-fpm (running), cli /usr/local/bin/php", crit[0][1])
+        self.assertIn("PHP 8.2+", crit[0][2])
+        self.assertNotIn("EOL branch without", crit[0][1])
+
+    def test_assess_install_no_longer_adds_eol_critical(self):
+        real = (guard.php_version_of, guard.read_marker_hits)
+        guard.php_version_of = lambda path, kind, ctx=None: ("8.0.1", "-v")
+        guard.read_marker_hits = lambda path: set()
+        try:
+            res = guard.assess_install({"path": "/usr/bin/php8.0", "sources": {"PATH"}}, [], [], no_config=True)
+        finally:
+            guard.php_version_of, guard.read_marker_hits = real
+        self.assertEqual(res["verdict"], "VULNERABLE")
+        self.assertEqual(self.criticals(res["findings"]), [])
+        crit = self.criticals(guard.unpatched_findings([res]))
+        self.assertEqual(len(crit), 1)
+        self.assertIn("8.2+", crit[0][2])
+
+    def test_host_groups_by_version(self):
+        installs = [self.inst("/usr/bin/php8.1", "cli", "8.1.2"), self.inst("/usr/sbin/php-fpm8.1", "fpm", "8.1.2", running=[5]),
+                    self.inst("/usr/bin/php8.3", "cli", "8.3.20", "vulnerable")]
+        crit = self.criticals(guard.unpatched_findings(installs))
+        self.assertEqual(len(crit), 2)
+        self.assertTrue(crit[0][1].startswith("PHP 8.1.2 is unpatched"))
+        self.assertEqual(crit[1][2], guard.HOST_UNPATCHED_FIX)
+
+    def test_container_cli_config_not_reported_twice(self):
+        conf = {"session.upload_progress.enabled": "On", "memory_limit": "128M"}
+        d = {"name": "c", "image": "i", "compose": None, "packages": [], "apache": [],
+             "installs": [self.inst("/usr/local/bin/php", "cli", conf=conf), self.inst("/usr/local/sbin/php-fpm", "fpm", running=[1], conf=conf)]}
+        highs = [f for f in guard.container_findings(d) if f[0] == "HIGH"]
+        self.assertEqual(len(highs), 1)
+        self.assertIn("php-fpm", highs[0][1])
+
+    def test_mitigations_marker(self):
+        mitigated = self.inst("/usr/local/sbin/php-fpm", "fpm", running=[1], conf={"session.upload_progress.enabled": "Off", "memory_limit": "-1"})
+        self.assertEqual(guard.mitigations_active(mitigated), ["upload_progress off", "memory_limit -1"])
+        crit = self.criticals(guard.unpatched_findings([mitigated, self.inst("/usr/local/bin/php", "cli")], "c"))
+        self.assertEqual(len(crit), 1)
+        self.assertIn("interim mitigations active (memory_limit -1, upload_progress off), still unpatched", crit[0][1])
+        pool_only = self.inst("/usr/local/sbin/php-fpm", "fpm", conf={"session.upload_progress.enabled": "On"},
+                              pools={"www": {"session.upload_progress.enabled": ("php_admin_flag", "off")},
+                                     "global": {}})
+        self.assertEqual(guard.mitigations_active(pool_only), ["upload_progress off"])
+        partial = self.inst("/usr/local/sbin/php-fpm", "fpm", conf={"session.upload_progress.enabled": "On"},
+                            pools={"www": {"session.upload_progress.enabled": ("php_admin_flag", "off")}, "api": {}})
+        self.assertEqual(guard.mitigations_active(partial), [])
+
+
 if __name__ == "__main__":
     unittest.main()

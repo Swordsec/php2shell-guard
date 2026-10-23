@@ -205,7 +205,7 @@ python3 php2shell-guard.py hunt --docker --days 14
           patch-markers=memory_hard_limit_percent  running pid 1  found-via=PATH,path-glob,process
   VULNERABLE php74  image=docker-multi-php-php74  compose docker-multi-php/php74
   ...
-  [CRITICAL] php74:/usr/local/sbin/php-fpm (fpm) is unpatched (PHP 7.4.33, branch 7.4 has no upstream fix ...)
+  [CRITICAL] php74: PHP 7.4.33 is unpatched (branch 7.4 has no upstream fix ...): fpm /usr/local/sbin/php-fpm (running), cli /usr/local/bin/php
              -> rebuild on PHP 8.2+ (e.g. php:8.3-fpm; ...): update FROM in the service's Dockerfile, then
                 docker compose -f .../docker-compose.yml build --pull php74 && docker compose -f ... up -d php74
 ```
@@ -218,6 +218,10 @@ python3 php2shell-guard.py hunt --docker --days 14
 
 With `--docker`, `protect` and `hunt` work on the containers instead of the host, and
 `hunt --logs/--session-dir/--webroot` name paths inside the containers.
+
+`protect` without `--docker` only changes the host. On a machine whose PHP runs only
+in containers it writes nothing, lists those containers and exits 2; use
+`protect --docker` (or `--container NAME`) there.
 
 Changes `protect` makes inside a container live in its writable layer: they survive
 `docker restart` but are gone after `docker compose up --build` / `--force-recreate` or
@@ -333,7 +337,7 @@ If your layout is missing, open an issue with `php --ini` output.
 | `scan` | all patched / no PHP | something vulnerable | undetermined | usage |
 | `hunt` | no CRITICAL/HIGH indicator | indicator found | | usage |
 | `remote` | nothing likely vulnerable | likely vulnerable target | all unreachable / no banner | usage |
-| `protect` | done / dry run | | | needs root / bad args / Docker unreachable |
+| `protect` | done / dry run | | no PHP on this host itself (use `--docker`) | needs root / bad args / Docker unreachable |
 
 ## Limitations
 

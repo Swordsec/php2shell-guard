@@ -50,7 +50,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 TOOL = "php2shell-guard"
 CVES = ("CVE-2026-109618", "CVE-2026-109619")
 ADVISORY_URL = "https://www.php.net/archive/2026.php#2026-10-21-5"
@@ -612,9 +612,19 @@ def binary_kind(path):
     return "cli"
 
 
+PROC_ROOT_RE = re.compile(r"^/proc/\d+/root/")
+
+
+def foreign_binary(path, ctx):
+    """True for a binary of another mount namespace reached through
+    /proc/<pid>/root. Such binaries are read, never executed: running a
+    container's PHP with the host's loader and environment is undefined."""
+    return ctx is HOST and bool(PROC_ROOT_RE.match(path or ""))
+
+
 def php_version_of(path, kind, ctx=None):
     ctx = ctx or HOST
-    if kind == "module":
+    if kind == "module" or foreign_binary(path, ctx):
         return ctx.bytes_version(path), "bytes"
     if kind == "frankenphp":
         rc, out, err = ctx.run([path, "version"], timeout=15)
@@ -713,6 +723,13 @@ def find_php_binaries():
             else:
                 add_ns(proc, mod, "container-process-maps")
     return list(found.values())
+
+
+def host_binaries():
+    """PHP that lives on this host itself: find_php_binaries() minus the
+    container runtimes reached through /proc/<pid>/root. protect and hunt
+    work on these; containers are handled through --docker."""
+    return [b for b in find_php_binaries() if not b.get("nsroot")]
 
 
 def iter_conf_files(dirs, exts=(".conf", ".htaccess", ".ini")):
@@ -1054,6 +1071,8 @@ def parse_phpinfo_text(text):
 def effective_ini_from_binary(path, kind, ctx=None):
     """Ask the binary itself for its effective configuration (`-i`)."""
     ctx = ctx or HOST
+    if foreign_binary(path, ctx):
+        return None, None, "container binary seen through /proc (not executed)"
     if kind == "module":
         return None, None, "module (no executable)"
     if kind == "frankenphp":
@@ -1285,9 +1304,7 @@ def assess_install(entry, procs, pkgs, no_config=False, ctx=None):
                     res["verdict"] = "PATCHED"
                     res["findings"].append(("INFO", "vendor backport confirmed by package check (%s %s)" % (pk["package"], pk["version"]), ""))
                     break
-        if res["verdict"] == "VULNERABLE":
-            res["findings"].append(("CRITICAL", "EOL branch without a confirmed vendor backport",
-                                    "upgrade to PHP 8.2+ or obtain an LTS backport; the minimal upstream backport branches exist for 7.4/8.0/8.1"))
+        # the single CRITICAL for this runtime comes from unpatched_findings()
     else:
         res["verdict"] = "UNKNOWN"
 
@@ -1331,20 +1348,85 @@ def config_findings(conf, context, verdict):
 
 
 HOST_UNPATCHED_FIX = "update to the fixed release for the branch and restart every worker"
+HOST_EOL_FIX = ("upgrade to PHP 8.2+ or install a vendor/LTS backport (the minimal upstream backports cover 7.4/8.0/8.1), "
+                "then restart every worker")
+PROC_CONTAINER_FIX = "rebuild that container's image on a fixed PHP (`scan --docker` prints the exact command)"
+# which binary of a group speaks for it: what serves HTTP first, the CLI last
+KIND_RANK = {"fpm": 0, "module": 0, "frankenphp": 0, "lsapi": 1, "cgi": 1, "cli": 2}
 
 
-def install_findings(inst, prefix="", unpatched_fix=HOST_UNPATCHED_FIX):
-    """Findings for one assessed install. prefix names the container, if any."""
+def host_unpatched_fix(inst):
+    if inst.get("proc_root"):
+        return PROC_CONTAINER_FIX
+    return HOST_EOL_FIX if inst.get("version_status") == "eol" else HOST_UNPATCHED_FIX
+
+
+def mitigations_active(inst):
+    """php.net interim mitigations visible in this runtime's effective
+    configuration. They lower exposure; they never make it PATCHED."""
+    conf = inst.get("config") or {}
+    pools = [v for k, v in ((inst.get("fpm_pools") or {}).get("pools") or {}).items() if k.lower() not in ("general", "global")]
+    up_off = ini_bool(conf.get("session.upload_progress.enabled")) is False
+    if not up_off and pools:
+        # every request-serving pool must set it; a pool that leaves it out inherits php.ini (On)
+        up_off = all(p.get("session.upload_progress.enabled") is not None
+                     and ini_bool(p["session.upload_progress.enabled"][1]) is False for p in pools)
+    active = []
+    if up_off:
+        active.append("upload_progress off")
+    if (conf.get("memory_limit") or "").strip() == "-1":
+        active.append("memory_limit -1")
+    return active
+
+
+def unpatched_findings(installs, prefix="", fix_for=host_unpatched_fix):
+    """One CRITICAL per unpatched runtime instead of one per binary: the CLI,
+    FPM and Apache module of the same build are one problem with one fix."""
+    groups, order = {}, []
+    for inst in installs:
+        if inst["verdict"] != "VULNERABLE":
+            continue
+        key = (inst.get("container") or "", inst.get("version"), inst.get("version_status"))
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(inst)
+    out = []
+    where = prefix + ": " if prefix else ""
+    for key in order:
+        g = sorted(groups[key], key=lambda i: (0 if i.get("running") else 1, KIND_RANK.get(i["kind"], 3), i["path"]))
+        lead = g[0]
+        parts = ["%s %s%s%s" % (i["kind"], i["path"], " (running)" if i.get("running") else "",
+                                " [container %s via /proc]" % i["container"] if i.get("proc_root") and i.get("container") not in (None, "yes")
+                                else " [container via /proc]" if i.get("proc_root") else "") for i in g]
+        title = "%sPHP %s is unpatched (%s): %s" % (where, lead["version"], lead["version_reason"], ", ".join(parts))
+        served = [i for i in g if i["kind"] != "cli"] or g
+        common = None
+        for i in served:
+            m = set(mitigations_active(i))
+            common = m if common is None else common & m
+        if common:
+            title += "; interim mitigations active (%s), still unpatched" % ", ".join(sorted(common))
+        out.append(("CRITICAL", title, fix_for(lead)))
+    return out
+
+
+def install_findings(inst, prefix="", unpatched_fix=HOST_UNPATCHED_FIX, include_unpatched=True, include_config=True):
+    """Findings for one assessed install. prefix names the container, if any.
+    Callers that group runtimes with unpatched_findings() pass
+    include_unpatched=False."""
     where = (prefix + ":" if prefix else "") + inst["path"]
     label = "%s (%s)" % (where, inst["kind"])
     pool_prefix = prefix + ": " if prefix else ""
     out = []
     for f in inst["findings"]:
         out.append((f[0], label + ": " + f[1], f[2]))
-    if inst["verdict"] == "VULNERABLE":
+    if inst["verdict"] == "VULNERABLE" and include_unpatched:
         out.append(("CRITICAL", "%s is unpatched (PHP %s, %s)" % (label, inst["version"], inst["version_reason"]), unpatched_fix))
     elif inst["verdict"] == "UNKNOWN":
         out.append(("MEDIUM", "%s: could not determine patch status" % label, "check manually"))
+    if not include_config:
+        return out
     out.extend(config_findings(inst.get("config"), label, inst["verdict"]))
     for sc in inst.get("sapi_configs", []):
         out.extend(config_findings(sc["config"], "%s [%s sapi: %s]" % (where, sc["sapi"], sc["ini_file"]), inst["verdict"]))
@@ -1431,8 +1513,9 @@ def cmd_scan(args):
 
     # aggregate findings
     findings = []
+    findings.extend(unpatched_findings(report["installs"]))
     for inst in report["installs"]:
-        findings.extend(install_findings(inst))
+        findings.extend(install_findings(inst, include_unpatched=False))
     findings.extend(package_findings(pkgs))
     findings.extend(apache_findings(report["apache"]))
     for d in report["docker"]:
@@ -1543,6 +1626,9 @@ def print_install(i, pad="  "):
         status_line = "status=%s: %s" % (i["version_status"], i["version_reason"])
     pad2 = pad + "    "
     print("%skind=%s  version=%s (%s)  %s" % (pad2, i["kind"], i["version"], i["version_source"], status_line))
+    if i["verdict"] == "VULNERABLE" and mitigations_active(i):
+        print(c("%sinterim mitigations active: %s (exposure reduced, still unpatched: update or rebuild)" % (
+            pad2, ", ".join(mitigations_active(i))), "yellow"))
     print("%spatch-markers=%s  %s  found-via=%s" % (pad2, fp, running, ",".join(i["sources"])))
     conf = i.get("config")
     if conf:
@@ -1981,9 +2067,13 @@ def container_fix(d, inst):
 
 
 def container_findings(d):
-    out = []
-    for inst in d["installs"]:
-        out.extend(install_findings(inst, d["name"], container_fix(d, inst)))
+    installs = d["installs"]
+    serves_http = any(i["kind"] != "cli" for i in installs)
+    out = unpatched_findings(installs, d["name"], lambda i: container_fix(d, i))
+    for inst in installs:
+        # the CLI's ini mirrors FPM's / mod_php's in a container; report the one that serves requests
+        out.extend(install_findings(inst, d["name"], include_unpatched=False,
+                                    include_config=not (serves_http and inst["kind"] == "cli")))
     out.extend(package_findings(d["packages"], d["name"]))
     out.extend(apache_findings(d["apache"], d["name"]))
     return out
@@ -2205,7 +2295,7 @@ def discover_confd_dirs(ctx=None, bins=None):
     ctx = ctx or HOST
     dirs = set(ctx.existing(CONFD_GLOBS, "d"))
     # ask each binary where it scans
-    for b in (find_php_binaries() if bins is None else bins):
+    for b in (host_binaries() if bins is None else bins):
         kind = binary_kind(b["path"])
         if kind == "module" or b.get("unreadable"):
             continue
@@ -2381,8 +2471,9 @@ def protect_target(args, ctx, bins, apply_):
     print("\nApache (mod_php) config:")
     if not adir or args.no_apache:
         print("  no Apache config dir found (or --no-apache)")
-    elif ctx is not HOST and not has_module:
-        print("  skipped: no mod_php in this container")
+    elif not has_module:
+        # an Apache without mod_php (reverse proxy, or PHP via FPM) ignores php_admin_*
+        print("  skipped: no mod_php %s" % ("in this container" if ctx is not HOST else "found on this host"))
     else:
         target = ctx.join(adir, APACHE_CONF_NAME)
         print("  write   %s" % ctx.where(target))
@@ -2425,7 +2516,10 @@ def cmd_protect(args):
     if docker:
         return protect_docker(args, apply_)
 
-    planned, changes = protect_target(args, HOST, find_php_binaries(), apply_)
+    bins = host_binaries()
+    if not bins:
+        return protect_nothing_on_host(apply_)
+    planned, changes = protect_target(args, HOST, bins, apply_)
 
     print("\nServices:")
     svcs = php_services()
@@ -2447,6 +2541,34 @@ def cmd_protect(args):
     else:
         print("Dry run complete. Re-run with --apply (as root) to write these changes.")
     return 0
+
+
+PROTECT_NOTHING_RC = 2
+
+
+def protect_nothing_on_host(apply_):
+    """Host mode on a machine whose PHP lives only in containers (or that has
+    none): writing host config would change nothing, so write nothing and say
+    where the PHP actually is."""
+    inner = [b for b in find_php_binaries() if b.get("nsroot")]
+    print(c("No PHP runtime on this host itself: nothing to protect here, nothing %s." %
+            ("written" if apply_ else "would be written"), "yellow"))
+    names = []
+    if which("docker"):
+        cts, err = docker_containers()
+        if not err:
+            names = sorted(ct.name for ct, _ in docker_php_targets()[0])
+    if names:
+        print("  PHP runs in these Docker containers: %s" % ", ".join(names))
+    elif inner:
+        print("  PHP runs in %d container process(es) seen through /proc (pids %s)" % (
+            len(inner), ",".join(str(p) for b in inner for p in b.get("pids", [])[:1])))
+    if names or inner or which("docker"):
+        print("  Host config does not reach them. Work inside the containers instead:")
+        print("    %s protect --docker%s" % (sys.argv[0], " --apply --restart" if apply_ else ""))
+        print("    %s protect --container NAME%s   (one container)" % (sys.argv[0], " --apply --restart" if apply_ else ""))
+    print("  Leftovers from an earlier host-mode run are removed with `%s protect --rollback --apply`." % sys.argv[0])
+    return PROTECT_NOTHING_RC
 
 
 def protect_docker(args, apply_):
@@ -2573,7 +2695,7 @@ def protect_rollback(args):
                 print(c("  reload with --restart so workers drop the mitigation config", "yellow"))
         print("\n%d item(s) %s." % (n, "removed" if apply_ else "would be removed"))
         return 0
-    n = rollback_target(HOST, find_php_binaries(), apply_)
+    n = rollback_target(HOST, host_binaries(), apply_)
     print("\n%d item(s) %s." % (n, "removed" if apply_ else "would be removed"))
     if args.restart:
         print("Services:")
@@ -2661,7 +2783,7 @@ def hunt_logs(paths, since, max_lines=2000000, hits=None):
 def session_dirs_from_scan(ctx=None, bins=None):
     ctx = ctx or HOST
     dirs = set()
-    for b in (find_php_binaries() if bins is None else bins):
+    for b in (host_binaries() if bins is None else bins):
         kind = binary_kind(b["path"])
         if kind == "module" or b.get("unreadable"):
             continue
