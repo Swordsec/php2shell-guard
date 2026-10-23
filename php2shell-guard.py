@@ -44,7 +44,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 TOOL = "php2shell-guard"
 CVES = ("CVE-2026-109618", "CVE-2026-109619")
 ADVISORY_URL = "https://www.php.net/archive/2026.php#2026-10-21-5"
@@ -595,12 +595,40 @@ def find_php_binaries():
                         add(mp, "LoadModule:" + conf)
         except OSError:
             continue
+    def add_ns(proc, inner_path, source):
+        """A binary that lives in another mount namespace (container): reach it
+        through /proc/<pid>/root and dedupe by device+inode."""
+        path = "/proc/%d/root%s" % (proc["pid"], inner_path)
+        try:
+            st_ = os.stat(path)
+        except OSError:
+            return
+        key = "ns:%d:%d" % (st_.st_dev, st_.st_ino)
+        if key in found:
+            found[key]["sources"].add(source)
+            found[key]["pids"].append(proc["pid"])
+            return
+        found[key] = {"path": path, "display": inner_path, "sources": {source}, "nsroot": True,
+                      "pids": [proc["pid"]], "container": proc.get("container")}
+
     for proc in running_processes():
-        if proc["exe"] and (BIN_NAME_RE.match(os.path.basename(proc["exe"])) or
-                            re.search(r"(libphp|mod_php)", proc["exe"])):
-            add(proc["exe"], "process")
+        exe = proc["exe"]
+        if exe and (BIN_NAME_RE.match(os.path.basename(exe)) or re.search(r"(libphp|mod_php)", exe)):
+            on_host = False
+            try:
+                hs = os.stat(exe)
+                on_host = proc["exe_stat"] is None or (hs.st_dev, hs.st_ino) == proc["exe_stat"]
+            except OSError:
+                on_host = False
+            if on_host:
+                add(exe, "process")
+            else:
+                add_ns(proc, exe, "container-process")
         for mod in proc.get("php_modules", []):
-            add(mod, "process-maps")
+            if os.path.exists(mod) and not proc.get("container"):
+                add(mod, "process-maps")
+            else:
+                add_ns(proc, mod, "container-process-maps")
     return list(found.values())
 
 
@@ -642,12 +670,25 @@ def running_processes():
                            comm.startswith(("php", "lsphp", "apache", "httpd", "frankenphp")))
             if not interesting:
                 continue
-            exe, deleted = None, False
+            exe, deleted, exe_stat = None, False, None
             try:
                 exe = os.readlink(base + "/exe")
                 if exe.endswith(" (deleted)"):
                     deleted = True
                     exe = exe[:-10]
+                st_ = os.stat(base + "/exe")
+                exe_stat = (st_.st_dev, st_.st_ino)
+            except OSError:
+                pass
+            container = None
+            try:
+                with open(base + "/cgroup", "r", errors="replace") as fh:
+                    cg = fh.read()
+                m = re.search(r"(?:docker[-/]|cri-containerd-|containerd[-/]|libpod-|podman[-/]|crio-|/kubepods[^\n]*?/)([0-9a-f]{12,64})", cg)
+                if m:
+                    container = m.group(1)[:12]
+                elif re.search(r"(?m)^\d+:[^:]*:/(docker|lxc|machine\.slice|kubepods|system\.slice/docker-)", cg):
+                    container = "yes"
             except OSError:
                 pass
             ppid, cmdline = None, ""
@@ -685,6 +726,7 @@ def running_processes():
             except OSError:
                 pass
             procs.append({"pid": int(pid), "ppid": ppid, "comm": comm, "exe": exe, "deleted": deleted,
+                          "exe_stat": exe_stat, "container": container,
                           "cmdline": cmdline, "php_modules": php_modules,
                           "module_deleted": module_deleted, "user": user})
     else:
@@ -702,6 +744,7 @@ def running_processes():
                     continue
                 exe = comm if os.path.isabs(comm) else which(name)
                 procs.append({"pid": int(pid), "ppid": int(ppid), "comm": name, "exe": exe, "deleted": False,
+                              "exe_stat": None, "container": None,
                               "cmdline": args, "php_modules": [], "module_deleted": False, "user": user})
     _PROC_CACHE = procs
     return procs
@@ -1033,23 +1076,37 @@ def scan_apache_configs():
 
 def assess_install(entry, procs, pkgs, no_config=False):
     path = entry["path"]
-    kind = binary_kind(path)
-    res = {"path": path, "kind": kind, "sources": sorted(entry["sources"]), "version": None,
+    nsroot = bool(entry.get("nsroot"))
+    display = entry.get("display", path)
+    kind = binary_kind(display)
+    res = {"path": display if nsroot else path, "kind": kind, "sources": sorted(entry["sources"]), "version": None,
            "version_source": None, "version_status": None, "version_reason": None,
            "fingerprint": [], "running": [], "stale_running": False, "config": None, "config_note": None,
-           "sapi_configs": [], "fpm_pools": None, "findings": [], "verdict": None}
+           "sapi_configs": [], "fpm_pools": None, "findings": [], "verdict": None,
+           "container": entry.get("container") if nsroot else None, "proc_root": path if nsroot else None}
     if entry.get("unreadable"):
         res["verdict"] = "UNKNOWN"
         res["findings"].append(("INFO", "binary not readable (run as root for a full check)", ""))
         return res
-    ver, how = php_version_of(path, kind)
+    if nsroot:
+        # never execute a foreign namespace's binary; read it instead
+        ver, how = version_from_bytes(path), "bytes"
+    else:
+        ver, how = php_version_of(path, kind)
     res["version"], res["version_source"] = ver, how
     st, why = classify_version(ver or "")
     res["version_status"], res["version_reason"] = st, why
     res["fingerprint"] = sorted(read_marker_hits(path))
 
+    if nsroot:
+        res["running"] = sorted(entry.get("pids", []))
+        pidset = set(res["running"])
+        res["stale_running"] = any(p["deleted"] for p in procs if p["pid"] in pidset)
+        res["config_note"] = "inside a container (pid %s%s); run scan in that container for ini/pool checks" % (
+            res["running"][0] if res["running"] else "?", ", id %s" % res["container"] if res["container"] and res["container"] != "yes" else "")
+        no_config = True
     for p in procs:
-        if p["exe"] == path or path in p.get("php_modules", []):
+        if not nsroot and (p["exe"] == path or path in p.get("php_modules", [])):
             res["running"].append(p["pid"])
             if p["deleted"] or (path in p.get("php_modules", []) and p["module_deleted"]):
                 res["stale_running"] = True
@@ -1169,8 +1226,14 @@ def cmd_scan(args):
 
     # Apache directives
     report["apache"] = scan_apache_configs()
+    report["docker_auto"] = False
     if args.docker:
         report["docker"] = scan_docker()
+    elif not any(not i.get("proc_root") for i in report["installs"]) and which("docker"):
+        # nothing on the host itself: PHP is probably inside containers
+        report["docker"] = scan_docker()
+        report["docker_auto"] = True
+    report["hints"] = no_php_hints(report) if not report["installs"] else []
 
     # aggregate findings
     findings = []
@@ -1233,6 +1296,8 @@ def cmd_scan(args):
             findings.append(("MEDIUM", "container %s (%s): PHP patch status unknown" % (d["name"], d["image"]), ""))
     if not report["installs"] and not report["docker"]:
         findings.append(("INFO", "no PHP binaries or Apache PHP modules found on this host", ""))
+    for h in report.get("hints", []):
+        findings.append(("INFO", h, ""))
 
     findings.sort(key=lambda f: SEV_RANK.get(f[0], 9))
     report["findings"] = [{"severity": s, "title": t, "fix": x} for s, t, x in findings]
@@ -1270,7 +1335,10 @@ def print_scan_report(r):
         running = ("running pid " + ",".join(map(str, i["running"][:6])) + (" ..." if len(i["running"]) > 6 else "")) if i["running"] else "not running"
         if i["stale_running"]:
             running += c(" STALE BINARY", "red")
-        print("  %s %s" % (c("%-10s" % i["verdict"], col), i["path"]))
+        where = ""
+        if i.get("proc_root"):
+            where = c("  [container%s via %s]" % (" " + i["container"] if i.get("container") and i["container"] != "yes" else "", i["proc_root"].split("/root")[0]), "cyan")
+        print("  %s %s%s" % (c("%-10s" % i["verdict"], col), i["path"], where))
         if i["verdict"] == "PATCHED" and i["version_status"] in ("vulnerable", "eol") and i["fingerprint"]:
             status_line = "status=backported (version string predates the fix; patch markers confirm the build)"
         else:
@@ -1308,7 +1376,7 @@ def print_scan_report(r):
             print("  %s %-6s %-28s %-40s %s" % (c("%-10s" % p["status"].upper(), col), p["manager"], p["package"], p["version"], p["detail"]))
     if r["docker"]:
         print()
-        banner("Docker containers (%d)" % len(r["docker"]))
+        banner("Docker containers (%d)%s" % (len(r["docker"]), " - inspected automatically, no PHP on the host" if r.get("docker_auto") else ""))
         for d in r["docker"]:
             col = {"PATCHED": "green", "VULNERABLE": "red"}.get(d["verdict"], "yellow")
             print("  %s %-24s %-40s php=%s markers=%s %s" % (c("%-10s" % d["verdict"], col), d["name"][:24], d["image"][:40], d["version"], d["fingerprint"], d["note"]))
@@ -1323,9 +1391,42 @@ def print_scan_report(r):
     print()
     col = {"PATCHED": "green", "VULNERABLE": "red", "NO_PHP": "dim"}.get(r["verdict"], "yellow")
     print(c("HOST VERDICT: %s" % r["verdict"], col) + "   (%.1fs)" % r["elapsed"])
+    if r["verdict"] == "NO_PHP":
+        print("  Nothing serving PHP was found on this host itself. If PHP runs in containers, pods, a snap or on another\n"
+              "  machine behind the web server here, run scan there (or with --docker). See the hints above.")
     if r["verdict"] == "VULNERABLE":
         print("  Update PHP to 8.5.12 / 8.4.27 / 8.3.36 / 8.2.35 (or your vendor backport) and restart every worker.")
         print("  Until then: `%s protect --apply` applies the php.net interim mitigations. See %s" % (sys.argv[0], ADVISORY_URL))
+
+
+def no_php_hints(report):
+    """Explain a NO_PHP result: what else is on the box that could still
+    front a PHP runtime somewhere else."""
+    hints = []
+    procs = running_processes()
+    web = sorted(set(p["comm"] for p in procs if p["comm"] in ("nginx", "apache2", "httpd", "caddy", "litespeed", "lshttpd")))
+    if web:
+        hints.append("web server running without a local PHP runtime (%s): it may proxy to containers, Kubernetes pods or another host; "
+                     "scan those" % ", ".join(web))
+    if which("docker"):
+        rc, out, _ = run(["docker", "ps", "-q"], timeout=20)
+        n = len(out.split()) if rc == 0 else 0
+        if rc != 0:
+            hints.append("docker is installed but `docker ps` failed (daemon down or no permission); PHP containers would not be visible")
+        elif n and not report.get("docker"):
+            hints.append("%d running container(s) inspected, none has a PHP binary" % n)
+        elif report.get("docker_auto"):
+            hints.append("no PHP on the host, so running containers were inspected automatically (same as --docker)")
+    for tool in ("podman", "kubectl", "ctr", "crictl"):
+        if which(tool):
+            hints.append("%s is installed: workloads under it are not inspected by this tool; run scan inside those containers/pods" % tool)
+    if which("snap"):
+        rc, out, _ = run(["snap", "list"], timeout=20)
+        if rc == 0 and re.search(r"(?m)^(nextcloud|wordpress|php)", out):
+            hints.append("a snap bundles its own PHP (see `snap list`); check its upstream for the fixed revision")
+    if os.name != "nt" and os.path.isdir("/proc") and not is_root():
+        hints.append("not root: binaries behind other users' processes may be invisible")
+    return hints
 
 
 def scan_docker():

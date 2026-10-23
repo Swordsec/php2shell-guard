@@ -93,6 +93,11 @@ What it looks at:
 * the binary behind every running `php-fpm`, `php-cgi`, `lsphp`, `frankenphp` worker, and
   whether that binary was **replaced since the worker started** (`(deleted)` in `/proc`),
   which means "patched on disk, still vulnerable in memory";
+* PHP workers that run **inside containers** (Docker, Podman, containerd, Kubernetes
+  nodes): their processes are visible in the host's `/proc`, so as root the tool reads the
+  binary through `/proc/<pid>/root` and fingerprints it without needing a container CLI.
+  These show as `[container via /proc/<pid>]`; config checks for them need a scan inside
+  the container;
 * dpkg / rpm / apk / pacman / Homebrew package state, with changelog CVE references;
 * effective INI per SAPI: `session.upload_progress.enabled`, `fatal_error_backtraces`,
   `memory_limit`, `post_max_size`, `upload_max_filesize`, `max_input_nesting_level`,
@@ -100,6 +105,9 @@ What it looks at:
 * Apache `php_value`/`php_admin_value`/`RLimitMEM` directives (php.net warns against
   `RLIMIT_AS`/`RLIMIT_DATA`: they cause exactly the allocation failure the bug needs);
 * with `--docker`, every running container: PHP version and patch markers inside it.
+  When the host itself has no PHP and `docker` is available, containers are inspected
+  automatically, and a `NO_PHP` result comes with hints (a web server with no local
+  runtime, Podman/kubectl present, snaps that bundle PHP).
 
 Severity drops automatically once a runtime is confirmed patched (e.g. upload progress
 still enabled becomes LOW, as php.net suggests keeping it off anyway).

@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.0.1 - 2026-10-23
+
+- `scan` finds PHP workers running inside containers from the host: their binaries are
+  read through `/proc/<pid>/root` (device+inode deduplicated, never executed) and
+  fingerprinted like local ones, without any container CLI. Reported as
+  `[container via /proc/<pid>]`.
+- When the host has no PHP of its own and `docker` is available, running containers are
+  inspected automatically; `NO_PHP` now prints hints (web server without a local runtime,
+  Podman/kubectl/ctr present, snaps bundling PHP, docker daemon unreachable).
+- Reported after a mailcow host (PHP only in `ghcr.io/mailcow/phpfpm`) came back `NO_PHP`.
+
 ## 1.0.0 - 2026-10-22
 
 Initial release, one day after the php.net fixed releases.
